@@ -22,14 +22,14 @@ There are two ways to open the site. Pick one.
 | | Option A: development server | Option B: Docker |
 |---|---|---|
 | Open in the browser | **http://localhost:5173** | **http://localhost:8001** |
-| Run from | `user-interfaces/frontend` | `user-interfaces/frontend` (its [`compose.yaml`](compose.yaml)) |
+| Run from | `frontend` | `frontend` (its [`compose.yaml`](compose.yaml)) |
 | Needs | Node.js 20.19+ or 22.12+ | Docker Desktop running |
 | Code changes | show up instantly (hot reload) | need a rebuild |
 
 ### Option A: development server (http://localhost:5173)
 
 ```bash
-cd user-interfaces/frontend
+cd frontend
 npm install          # first time only, and after package.json changes
 npm run dev          # then open http://localhost:5173
 ```
@@ -39,7 +39,7 @@ Leave the terminal open while you use the site; stop it with **Ctrl+C**.
 ### Option B: Docker (http://localhost:8001) (recommended)
 
 ```bash
-cd user-interfaces/frontend
+cd frontend
 cp .env.example .env             # first time only, then fill it in (see Configuration)
 docker compose up -d --build     # then open http://localhost:8001
 ```

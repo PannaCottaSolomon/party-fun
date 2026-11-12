@@ -2,7 +2,7 @@
 
 Source: [`events/.gitlab-ci.yml`](events/.gitlab-ci.yml) · related: [`events/Dockerfile`](events/Dockerfile), [`events/ci/smoke-test.sh`](events/ci/smoke-test.sh), [`events/pom.xml`](events/pom.xml)
 
-For what the service itself does, see [events.md](events.md). For what happens after this pipeline (deploying to AWS), see [DEVOPS_FLOW.md](../infrastructure/templates/DEVOPS_FLOW.md).
+For what the service itself does, see [events.md](events.md). For what happens after this pipeline (deploying to AWS), see [DEVOPS_FLOW.md](../infrastructure/DEVOPS_FLOW.md).
 
 ## What it does
 

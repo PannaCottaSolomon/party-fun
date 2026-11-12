@@ -27,7 +27,7 @@ Notification Services (each with its RDS database) are in here.
 | `partyfun-chaos` | **Fault Injection Service** + **CloudWatch** | 5 experiment templates, their role, alarm `partyfun-money-at-risk`, log group `/fis/partyfun` | Chaos engineering ([`templates/chaos.yaml`](templates/chaos.yaml), `./deploy.sh chaos` / `deploy-chaos` only) |
 
 [`deploy.sh`](deploy.sh) deploys them in that order. Every run creates or updates them (only what changed). It then
-builds the frontend (`../user-interfaces/frontend`) against the API's URL, uploads it to the bucket and refreshes
+builds the frontend (`../frontend`) against the API's URL, uploads it to the bucket and refreshes
 CloudFront.
 
 ## How authentication works
@@ -136,7 +136,7 @@ The defaults are fine for a first deploy:
 | `AWS_REGION` | `ap-southeast-1` | Region for every stack |
 | `STACK_PREFIX` | `partyfun` | Prefix of stack, resource and export names (one per environment, e.g. `partyfun-dev`) |
 | `AWS_PROFILE` | empty | Named CLI profile; empty = default credentials |
-| `FRONTEND_DIR` | `../user-interfaces/frontend` | The React app to build and upload |
+| `FRONTEND_DIR` | `../frontend` | The React app to build and upload |
 
 No secrets go in `config.env`.
 

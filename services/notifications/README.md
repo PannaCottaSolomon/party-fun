@@ -304,8 +304,8 @@ The unit tests use a fake channel that simulates the broker, including a full re
 ## Running on AWS (ECS)
 
 On AWS the service is one **ECS Fargate task** running the same image as locally, with its notification log and
-user directory in its own **MySQL RDS** database. It is defined and deployed in the **infrastructure** repo:
-`templates/notifications.yaml`, deployed by its `deploy-notifications` job. That repo's README lists the one-time
+user directory in its own **MySQL RDS** database. It is defined and deployed in the **infrastructure** repo ([`infrastructure/`](../../infrastructure/)):
+[`templates/notifications.yaml`](../../infrastructure/templates/notifications.yaml), deployed by its `deploy-notifications` job. [That repo's README](../../infrastructure/README.md#notification-service) lists the one-time
 setup (a GitLab deploy token, the Resend key in Secrets Manager) and what the stack creates.
 
 The service creates its exchanges, queues and tables itself on startup, so nothing has to be prepared on RabbitMQ or

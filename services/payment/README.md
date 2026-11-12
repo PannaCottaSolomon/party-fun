@@ -29,7 +29,6 @@ Java 21 · Spring Boot 4.1 · Spring Data JPA · MySQL · Stripe Java SDK · Spr
   [migrating an existing broker](#migrating-an-existing-rabbitmq-broker)
 - [Notification Service compatibility](#notification-service-compatibility)
 - [Changes needed outside the Payment Service](#changes-needed-outside-the-payment-service)
-- [Diagrams](#diagrams)
 - [GitLab CI/CD](#gitlab-cicd)
 
 ---
@@ -179,7 +178,7 @@ stripe listen --forward-to localhost:8080/payments/webhook/stripe
 
 **3. Configure.** Put the values in `services/payment/dev.env` (copy [`dev.env.example`](dev.env.example);
 gitignored). Both `docker compose` and Maven read it. The frontend (`npm run dev` and its Docker nginx) reads
-`payment_admin_api_key` / `payment_service_api_key` from `user-interfaces/frontend/.env`, so put the same two keys
+`payment_admin_api_key` / `payment_service_api_key` from `frontend/.env`, so put the same two keys
 there.
 
 ```properties
@@ -1728,7 +1727,7 @@ Only the health endpoint is exposed, with no details; nothing else under `/actua
 
 ### Testing from the frontend
 
-The party.fun frontend (`user-interfaces/frontend`) pays and refunds through this service for real, in the Stripe
+The party.fun frontend (`frontend`) pays and refunds through this service for real, in the Stripe
 sandbox. Its README ("Payments") has the full click path; in short:
 
 1. Set `stripe_publishable_key` (`pk_test_…`) next to the other Stripe values and recreate Payment. `stripe listen`
@@ -1743,7 +1742,7 @@ sandbox. Its README ("Payments") has the full click path; in short:
    `POST /admin/refunds/{paymentId}/retry` with `X-Admin-Api-Key` (see [Admin recovery](#admin-recovery-of-failed-refunds)).
 
 The browser never holds either key: the frontend's own server (nginx in Docker, the Vite dev server) forwards exactly
-those calls and adds the key from its configuration (`user-interfaces/frontend/.env`). That is a stand-in until the Authentication Service issues `ADMIN` JWTs.
+those calls and adds the key from its configuration (`frontend/.env`). That is a stand-in until the Authentication Service issues `ADMIN` JWTs.
 
 A declined card can be retried with another card on the same PaymentIntent; that's why `payment_intent.succeeded`
 can turn a `FAILED` payment into `PAID` (see [Status transitions](#status-transitions)).
@@ -2321,21 +2320,6 @@ architecture (checked against their current code):
 
 ---
 
-## Diagrams
-
-PlantUML sequence diagrams in [`docs/`](docs). `->` is a synchronous call, `-->` a synchronous response and
-`->>` an asynchronous message.
-
-| File | Scenario |
-|---|---|
-| [`docs/scenario1-payment.puml`](docs/scenario1-payment.puml) | Ticket payment: Event Service → Payment → Stripe (synchronous), with the pending and webhook path |
-| [`docs/scenario3-refunds.puml`](docs/scenario3-refunds.puml) | Event cancellation refunds: `event.cancelled`, each refund processed inside Payment, `notify.refund`, failed refunds published to `payments.refund.dlx` → `payments.refunds.dlq` with `notify.admin_alert`, and the Admin's recovery over HTTP (ack on success) |
-
-Render them with the VS Code PlantUML extension, <https://www.plantuml.com/plantuml>, or
-`java -jar plantuml.jar docs/*.puml`.
-
----
-
 ## GitLab CI/CD
 
 [`.gitlab-ci.yml`](.gitlab-ci.yml) has three stages. Release means publishing the image only; deploying is done
@@ -2353,8 +2337,9 @@ by hand from the infrastructure project (see [Deploying to AWS ECS](#deploying-t
 ### Deploying to AWS ECS
 
 The AWS side (ECS service, MySQL RDS database, secrets) is defined in the **infrastructure** project
-(`cs302-2026/g4-team2/infrastructure`, `templates/payment.yaml`, CloudFormation stack `partyfun-payment`); see its
-README. This project only releases the image; nothing deploys automatically:
+(`cs302-2026/g4-team2/infrastructure`, here [`infrastructure/`](../../infrastructure/);
+[`templates/payment.yaml`](../../infrastructure/templates/payment.yaml), CloudFormation stack `partyfun-payment`); see
+[its README](../../infrastructure/README.md#payment-service). This project only releases the image; nothing deploys automatically:
 
 1. A push to `main` passes the tests, and `release-image` pushes
    `registry.gitlab.com/cs302-2026/g4-team2/services/payment/main:<commit sha>`.

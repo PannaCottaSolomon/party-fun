@@ -44,7 +44,7 @@ set +a
 
 AWS_REGION="${AWS_REGION:-ap-southeast-1}"
 STACK_PREFIX="${STACK_PREFIX:-partyfun}"
-FRONTEND_DIR="${FRONTEND_DIR:-../user-interfaces/frontend}"
+FRONTEND_DIR="${FRONTEND_DIR:-../frontend}"
 VPC_ID="${VPC_ID:-}"
 SUBNET_IDS="${SUBNET_IDS:-}"
 RABBITMQ_ADMIN_CIDR="${RABBITMQ_ADMIN_CIDR:-127.0.0.1/32}"
