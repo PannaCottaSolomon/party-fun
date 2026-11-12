@@ -1,0 +1,284 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  party.fun chaos engineering with AWS Fault Injection Service (FIS): one experiment template per failure along the
+  money path (signup payment, event cancellation, refund), the role FIS runs them with, and the "money at risk"
+  alarm that stops any running experiment. Needs the cluster, rabbitmq, events and payment stacks (it adds metric
+  filters to the events and payment log groups). The network experiments also need the Event Service deployed with
+  FaultInjection=true. Run an experiment with chaos/run.mjs (or the chaos-* jobs), which also drives traffic and
+  checks that every payment made during the fault is refunded.
+
+Parameters:
+  Prefix:
+    Type: String
+    Default: partyfun
+    AllowedPattern: '[a-z][a-z0-9-]{1,30}'
+    Description: Name prefix for every resource and export (lowercase).
+  NetworkFaultDuration:
+    Type: String
+    Default: PT3M
+    AllowedPattern: 'PT([1-9]|1[0-5])M'
+    Description: How long the network experiments impair the Event Service's traffic to Payment (1 to 15 minutes).
+
+Resources:
+  # ---- Stop condition: money at risk ----
+
+  # Both lines mean a refund no longer completes on its own: Payment moved a refund to its DLQ (Stripe kept failing),
+  # or Payment refused the Event Service's compensation refund (wrong service key or URL). Any experiment still
+  # running is stopped at once, and one can't start while the alarm is on.
+  PaymentRefundFailedFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Sub /ecs/${Prefix}/payment
+      FilterPattern: '"Refund for payment" "failed"'
+      MetricTransformations:
+        - MetricNamespace: !Sub ${Prefix}/chaos
+          MetricName: MoneyAtRisk
+          MetricValue: '1'
+
+  EventsRefundRefusedFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Sub /ecs/${Prefix}/events
+      FilterPattern: '"was refused" "it stays owed"'
+      MetricTransformations:
+        - MetricNamespace: !Sub ${Prefix}/chaos
+          MetricName: MoneyAtRisk
+          MetricValue: '1'
+
+  MoneyAtRiskAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${Prefix}-money-at-risk
+      AlarmDescription: >-
+        A refund stopped completing by itself (Payment's refund DLQ, or a compensation refund refused). Stops every
+        running FIS experiment.
+      Namespace: !Sub ${Prefix}/chaos
+      MetricName: MoneyAtRisk
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  # ---- The role FIS runs the experiments with ----
+
+  ExperimentLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /fis/${Prefix}
+      RetentionInDays: 30
+
+  # Stops ECS tasks, and sends the network fault SSM documents to the Event Service's SSM agent sidecar.
+  ExperimentRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: fis.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSFaultInjectionSimulatorECSAccess
+      Policies:
+        - PolicyName: experiment-logs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogDelivery
+                  - logs:PutResourcePolicy
+                  - logs:DescribeResourcePolicies
+                  - logs:DescribeLogGroups
+                Resource: '*'
+
+  # ---- Experiments ----
+  # Each one breaks a single thing. The hypothesis is the same for all: the fault costs availability, never money.
+  # Every booking paid before or during the fault is refunded once its event is cancelled, nobody is charged twice,
+  # and the services return to normal by themselves.
+
+  # Payment crashes: ECS starts a new task. Signups during the outage keep their place (PENDING), and an event
+  # cancelled meanwhile waits in Payment's durable queue until it is back.
+  PaymentDownExperiment:
+    Type: AWS::FIS::ExperimentTemplate
+    Properties:
+      Description: Stop the Payment Service's task (crash); ECS replaces it
+      RoleArn: !GetAtt ExperimentRole.Arn
+      StopConditions:
+        - Source: aws:cloudwatch:alarm
+          Value: !GetAtt MoneyAtRiskAlarm.Arn
+      Targets:
+        PaymentTasks:
+          ResourceType: aws:ecs:task
+          SelectionMode: ALL
+          Parameters:
+            cluster: !Sub ${Prefix}-payment
+            service: payment
+      Actions:
+        StopPayment:
+          ActionId: aws:ecs:stop-task
+          Targets:
+            Tasks: PaymentTasks
+      LogConfiguration:
+        LogSchemaVersion: 2
+        CloudWatchLogsConfiguration:
+          LogGroupArn: !GetAtt ExperimentLogGroup.Arn
+      Tags:
+        Name: !Sub ${Prefix}-payment-down
+        project: !Ref Prefix
+
+  # The broker crashes: queued messages survive on EFS. An event cancelled meanwhile stays in the Event Service's
+  # outbox until the broker confirms it.
+  BrokerDownExperiment:
+    Type: AWS::FIS::ExperimentTemplate
+    Properties:
+      Description: Stop the RabbitMQ task (crash); ECS replaces it, queues survive on EFS
+      RoleArn: !GetAtt ExperimentRole.Arn
+      StopConditions:
+        - Source: aws:cloudwatch:alarm
+          Value: !GetAtt MoneyAtRiskAlarm.Arn
+      Targets:
+        BrokerTasks:
+          ResourceType: aws:ecs:task
+          SelectionMode: ALL
+          Parameters:
+            cluster: !Ref Prefix
+            service: rabbitmq
+      Actions:
+        StopBroker:
+          ActionId: aws:ecs:stop-task
+          Targets:
+            Tasks: BrokerTasks
+      LogConfiguration:
+        LogSchemaVersion: 2
+        CloudWatchLogsConfiguration:
+          LogGroupArn: !GetAtt ExperimentLogGroup.Arn
+      Tags:
+        Name: !Sub ${Prefix}-broker-down
+        project: !Ref Prefix
+
+  # The Event Service crashes: ECS starts a new task. Owed refunds, unconfirmed payments and unsent outbox messages
+  # are in its database, so the new task picks them up.
+  EventsCrashExperiment:
+    Type: AWS::FIS::ExperimentTemplate
+    Properties:
+      Description: Stop the Event Service's task (crash); ECS replaces it
+      RoleArn: !GetAtt ExperimentRole.Arn
+      StopConditions:
+        - Source: aws:cloudwatch:alarm
+          Value: !GetAtt MoneyAtRiskAlarm.Arn
+      Targets:
+        EventsTasks:
+          ResourceType: aws:ecs:task
+          SelectionMode: ALL
+          Parameters:
+            cluster: !Sub ${Prefix}-events
+            service: events
+      Actions:
+        StopEvents:
+          ActionId: aws:ecs:stop-task
+          Targets:
+            Tasks: EventsTasks
+      LogConfiguration:
+        LogSchemaVersion: 2
+        CloudWatchLogsConfiguration:
+          LogGroupArn: !GetAtt ExperimentLogGroup.Arn
+      Tags:
+        Name: !Sub ${Prefix}-events-crash
+        project: !Ref Prefix
+
+  # A network partition between the two services, while both stay up: every packet from the Event Service to
+  # payment.<Prefix>.local is dropped (nothing else is touched, so the database, the broker and the health check keep
+  # working). Signups keep their place (PENDING) and can be paid once the network is back.
+  PaymentUnreachableExperiment:
+    Type: AWS::FIS::ExperimentTemplate
+    Properties:
+      Description: Drop all traffic from the Event Service to the Payment Service (network partition)
+      RoleArn: !GetAtt ExperimentRole.Arn
+      StopConditions:
+        - Source: aws:cloudwatch:alarm
+          Value: !GetAtt MoneyAtRiskAlarm.Arn
+      Targets:
+        EventsTasks:
+          ResourceType: aws:ecs:task
+          SelectionMode: ALL
+          Parameters:
+            cluster: !Sub ${Prefix}-events
+            service: events
+      Actions:
+        DropTrafficToPayment:
+          ActionId: aws:ecs:task-network-packet-loss
+          Parameters:
+            duration: !Ref NetworkFaultDuration
+            lossPercent: '100'
+            sources: !Sub payment.${Prefix}.local
+            useEcsFaultInjectionEndpoints: 'true'
+            installDependencies: 'true'
+          Targets:
+            Tasks: EventsTasks
+      LogConfiguration:
+        LogSchemaVersion: 2
+        CloudWatchLogsConfiguration:
+          LogGroupArn: !GetAtt ExperimentLogGroup.Arn
+      Tags:
+        Name: !Sub ${Prefix}-payment-unreachable
+        project: !Ref Prefix
+
+  # A slow network to Payment: every packet from the Event Service to it is delayed 1.5 s (+- 0.4 s), close to the
+  # 2 s connect timeout. Signups are slow and some time out; none may be charged without a place or charged twice.
+  PaymentSlowExperiment:
+    Type: AWS::FIS::ExperimentTemplate
+    Properties:
+      Description: Delay all traffic from the Event Service to the Payment Service by 1.5 s
+      RoleArn: !GetAtt ExperimentRole.Arn
+      StopConditions:
+        - Source: aws:cloudwatch:alarm
+          Value: !GetAtt MoneyAtRiskAlarm.Arn
+      Targets:
+        EventsTasks:
+          ResourceType: aws:ecs:task
+          SelectionMode: ALL
+          Parameters:
+            cluster: !Sub ${Prefix}-events
+            service: events
+      Actions:
+        DelayTrafficToPayment:
+          ActionId: aws:ecs:task-network-latency
+          Parameters:
+            duration: !Ref NetworkFaultDuration
+            delayMilliseconds: '1500'
+            jitterMilliseconds: '400'
+            sources: !Sub payment.${Prefix}.local
+            useEcsFaultInjectionEndpoints: 'true'
+            installDependencies: 'true'
+          Targets:
+            Tasks: EventsTasks
+      LogConfiguration:
+        LogSchemaVersion: 2
+        CloudWatchLogsConfiguration:
+          LogGroupArn: !GetAtt ExperimentLogGroup.Arn
+      Tags:
+        Name: !Sub ${Prefix}-payment-slow
+        project: !Ref Prefix
+
+Outputs:
+  PaymentDownTemplateId:
+    Value: !Ref PaymentDownExperiment
+  BrokerDownTemplateId:
+    Value: !Ref BrokerDownExperiment
+  EventsCrashTemplateId:
+    Value: !Ref EventsCrashExperiment
+  PaymentUnreachableTemplateId:
+    Value: !Ref PaymentUnreachableExperiment
+  PaymentSlowTemplateId:
+    Value: !Ref PaymentSlowExperiment
+  MoneyAtRiskAlarmName:
+    Value: !Ref MoneyAtRiskAlarm
+  ExperimentLogGroupName:
+    Value: !Ref ExperimentLogGroup

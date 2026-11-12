@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  SpotBugs exclusions. Kept deliberately small.
+
+  EI_EXPOSE_REP / EI_EXPOSE_REP2: Spring injects shared beans (repositories, RabbitTemplate, JsonMapper...)
+  through constructors and JPA entities hold references to each other by design. SpotBugs reports every
+  one of these as "may expose internal representation", which is noise in a Spring application.
+-->
+<FindBugsFilter>
+    <Match>
+        <Bug pattern="EI_EXPOSE_REP,EI_EXPOSE_REP2"/>
+    </Match>
+</FindBugsFilter>

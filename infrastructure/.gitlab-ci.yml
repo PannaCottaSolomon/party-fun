@@ -1,0 +1,543 @@
+# Deploys the shared AWS services (CloudFormation) and the frontend by running deploy.sh, and the Event, Payment and
+# Authentication Services (templates/events.yaml, templates/payment.yaml, templates/auth.yaml: ECS + an RDS database
+# each) with the images their own pipelines released from main.
+# Every deploy job is manual: click Run on it in a main pipeline. deploy-all deploys everything; the others deploy
+# one part. AWS credentials come from the g4-team2 group's protected CI/CD variables (AWS_ACCESS_KEY_ID,
+# AWS_SECRET_ACCESS_KEY, AWS_DEFAULT_REGION), so only main can use them.
+# The Event Service needs EVENTS_REGISTRY_USERNAME / EVENTS_REGISTRY_TOKEN (a GitLab deploy token, read_registry).
+# The Payment Service (templates/payment.yaml) needs PAYMENT_REGISTRY_USERNAME / PAYMENT_REGISTRY_TOKEN (a deploy
+# token on the payment project, read_registry).
+# The Authentication Service (templates/auth.yaml) needs AUTH_REGISTRY_USERNAME / AUTH_REGISTRY_TOKEN (a deploy token
+# on the authentication project, read_registry).
+# Optional: ECS_EXECUTION_ROLE_ARN and ECS_TASK_ROLE_ARN (existing roles, e.g. LabRole, when the account can't create
+# IAM roles), RABBITMQ_HOST and EVENTS_PAYMENT_BASE_URL (once those services run), PAYMENT_IMAGE_TAG /
+# AUTH_IMAGE_TAG (a commit sha to deploy instead of main's newest), AUTH_ADMIN_EMAIL (seed the ADMIN account),
+# AUTH_EMAIL_VERIFICATION (true / false, default false), SKIP_SERVICE_DISCOVERY (true: deploy a service once without
+# its Cloud Map registration; only needed if CloudFormation can't change an existing registration in place).
+# API Gateway (deploy-api) routes to the auth, events, payment and notifications services through Cloud Map: deploy
+# them first.
+# Chaos engineering (AWS FIS): deploy-chaos, then the chaos-* jobs; see the chaos stage below.
+
+stages:
+  - validate
+  - deploy
+  - chaos
+
+variables:
+  # Released as :latest by the events project's pipeline on every main commit that passes its tests and scan.
+  EVENTS_IMAGE: registry.gitlab.com/cs302-2026/g4-team2/services/events
+  # Released as main:<commit sha> by the payment project's release-image job.
+  PAYMENT_IMAGE: registry.gitlab.com/cs302-2026/g4-team2/services/payment/main
+  # Released as :latest by the authentication project's pipeline on every main commit that passes its tests and scan;
+  # every pipeline also pushes :<commit sha>.
+  AUTH_IMAGE: registry.gitlab.com/cs302-2026/g4-team2/services/authentication
+  # Released as main:<commit sha> by the notifications project's release-image job (like payment).
+  NOTIFICATIONS_IMAGE: registry.gitlab.com/cs302-2026/g4-team2/services/notifications/main
+
+cfn-lint:
+  stage: validate
+  image: python:3.12-slim
+  script:
+    - pip install --quiet cfn-lint
+    - cfn-lint templates/*.yaml
+
+.deploy:
+  stage: deploy
+  image: node:22-bookworm
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual
+  allow_failure: true
+  interruptible: false
+  resource_group: aws-infrastructure   # never two deploys at once
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq unzip > /dev/null
+    - curl -sSL https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip -o /tmp/awscliv2.zip
+    - unzip -q /tmp/awscliv2.zip -d /tmp && /tmp/aws/install > /dev/null
+    - aws --version
+    # config.env is git-ignored; later lines override the example's values.
+    - cp config.env.example config.env
+    - echo "FRONTEND_DIR=frontend-src" >> config.env
+
+# The frontend is its own repo; its Job token permissions must allow this project.
+.clone-frontend: &clone-frontend
+  - git clone --depth 1 "https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.com/cs302-2026/g4-team2/user-interfaces/frontend.git" frontend-src
+
+# Deploys the <prefix>-events stack (ECS service + its RDS database, in the default VPC) with the latest events
+# image; ECS pulls it straight from the GitLab registry. :latest moves with every release, so it is first resolved
+# to the commit it was built from, and that commit's immutable tag goes into the task definition: a new build rolls
+# the service, an unchanged one changes nothing. Needs the secrets and cognito stacks, and a GitLab deploy token
+# with read_registry in the masked CI/CD variables EVENTS_REGISTRY_USERNAME / EVENTS_REGISTRY_TOKEN (ECS keeps
+# using it after this job ends). skopeo reads the image's labels without Docker.
+.deploy-events: &deploy-events
+  - apt-get install -y -qq skopeo > /dev/null
+  - set -a && . ./config.env && set +a
+  - if [ -z "$AWS_PROFILE" ]; then unset AWS_PROFILE; fi
+  - export AWS_DEFAULT_REGION="$AWS_REGION"
+  - echo "$EVENTS_REGISTRY_TOKEN" | skopeo login --username "$EVENTS_REGISTRY_USERNAME" --password-stdin "$CI_REGISTRY"
+  - EVENTS_REVISION=$(skopeo --override-os linux --override-arch amd64 inspect
+      --format '{{ index .Labels "org.opencontainers.image.revision" }}' "docker://$EVENTS_IMAGE:latest")
+  - |
+    if ! echo "$EVENTS_REVISION" | grep -Eq '^[0-9a-f]{40}$'; then
+      echo "ERROR: $EVENTS_IMAGE:latest has no org.opencontainers.image.revision label (got '$EVENTS_REVISION')" >&2
+      exit 1
+    fi
+  - IMAGE_URI="$EVENTS_IMAGE:$EVENTS_REVISION"
+  - VPC_ID=$(aws ec2 describe-vpcs --filters Name=is-default,Values=true --query "Vpcs[0].VpcId" --output text)
+  - |
+    if [ "$VPC_ID" = "None" ]; then
+      echo "ERROR: this region has no default VPC (create one with: aws ec2 create-default-vpc)" >&2
+      exit 1
+    fi
+  - SUBNET_IDS=$(aws ec2 describe-subnets --filters Name=vpc-id,Values="$VPC_ID" Name=default-for-az,Values=true
+      --query "Subnets[].SubnetId" --output text | tr '\t' ',')
+  # Optional stacks: an empty value leaves that feature off (see the template's parameters).
+  - |
+    # A stack without that output (e.g. one that failed to create) prints "None": treat it as missing.
+    stack_output() {
+      value=$(aws cloudformation describe-stacks --stack-name "$STACK_PREFIX-$1" \
+        --query "Stacks[0].Outputs[?OutputKey=='$2'].OutputValue" --output text 2>/dev/null || true)
+      if [ "$value" != "None" ]; then echo "$value"; fi
+    }
+    SERVICES_SG=$(stack_output cluster ServicesSecurityGroupId)
+    NAMESPACE_ID=$(stack_output cluster NamespaceId)
+    OTLP_ENDPOINT=$(stack_output observability OtlpEndpoint)
+    # Fallback: true once removes the Cloud Map registration (see README: API Gateway routing).
+    if [ "${SKIP_SERVICE_DISCOVERY:-}" = "true" ]; then NAMESPACE_ID=""; fi
+    # The CI/CD variables win when set; otherwise the broker and Payment come from their stacks, like the other jobs.
+    EVENTS_RABBITMQ_HOST="${RABBITMQ_HOST:-$(stack_output rabbitmq Host)}"
+    EVENTS_PAYMENT_URL="${EVENTS_PAYMENT_BASE_URL:-$(stack_output payment InternalUrl)}"
+  - echo "Deploying events $IMAGE_URI to stack $STACK_PREFIX-events (VPC $VPC_ID, subnets $SUBNET_IDS, broker '${EVENTS_RABBITMQ_HOST}', payment '${EVENTS_PAYMENT_URL}', fault injection ${EVENTS_FAULT_INJECTION:-false})"
+  # Waits until the new task passes its health check; a task that never does is rolled back and fails this job.
+  - aws cloudformation deploy
+      --stack-name "$STACK_PREFIX-events"
+      --template-file templates/events.yaml
+      --no-fail-on-empty-changeset
+      --capabilities CAPABILITY_IAM
+      --tags project="$STACK_PREFIX"
+      --parameter-overrides
+      Prefix="$STACK_PREFIX"
+      ImageUri="$IMAGE_URI"
+      RegistryUsername="$EVENTS_REGISTRY_USERNAME"
+      RegistryToken="$EVENTS_REGISTRY_TOKEN"
+      VpcId="$VPC_ID"
+      SubnetIds="$SUBNET_IDS"
+      ExecutionRoleArn="${ECS_EXECUTION_ROLE_ARN:-}"
+      RabbitMqHost="$EVENTS_RABBITMQ_HOST"
+      PaymentBaseUrl="$EVENTS_PAYMENT_URL"
+      ServicesSecurityGroupId="$SERVICES_SG"
+      NamespaceId="$NAMESPACE_ID"
+      OtlpEndpoint="$OTLP_ENDPOINT"
+      FaultInjection="${EVENTS_FAULT_INJECTION:-false}"
+  # No load balancer: the API is at the running task's public IP (it changes whenever the task is replaced).
+  - TASK_ARN=$(aws ecs list-tasks --cluster "$STACK_PREFIX-events" --service-name events
+      --desired-status RUNNING --query "taskArns[0]" --output text)
+  - |
+    if [ "$TASK_ARN" != "None" ]; then
+      ENI_ID=$(aws ecs describe-tasks --cluster "$STACK_PREFIX-events" --tasks "$TASK_ARN" \
+        --query "tasks[0].attachments[0].details[?name=='networkInterfaceId'].value" --output text)
+      PUBLIC_IP=$(aws ec2 describe-network-interfaces --network-interface-ids "$ENI_ID" \
+        --query "NetworkInterfaces[0].Association.PublicIp" --output text)
+      echo "Event Service: http://$PUBLIC_IP:8080 (health: http://$PUBLIC_IP:8080/actuator/health)"
+    fi
+    if [ -n "$NAMESPACE_ID" ]; then
+      echo "Inside the VPC: http://events.$STACK_PREFIX.local:8080 (run deploy-api so API Gateway routes to it)"
+    fi
+
+# Deploys the <prefix>-payment stack (ECS service + its MySQL RDS database, in the default VPC). The payment
+# project's release job tags images main:<commit sha> (no :latest), so the job deploys main's newest commit, or
+# PAYMENT_IMAGE_TAG if set; that commit's pipeline must have released its image. Needs the secrets stack (Stripe
+# sandbox keys set in <prefix>/payment), a GitLab deploy token on the payment project (read_registry) in
+# PAYMENT_REGISTRY_USERNAME / PAYMENT_REGISTRY_TOKEN, and the payment project's Job token permissions must allow
+# this project. Uses the cluster, rabbitmq and frontend stacks when they exist (broker, payment.<prefix>.local, CORS).
+.deploy-payment: &deploy-payment
+  - apt-get install -y -qq skopeo > /dev/null
+  - set -a && . ./config.env && set +a
+  - if [ -z "$AWS_PROFILE" ]; then unset AWS_PROFILE; fi
+  - export AWS_DEFAULT_REGION="$AWS_REGION"
+  - |
+    PAYMENT_REVISION="${PAYMENT_IMAGE_TAG:-}"
+    if [ -z "$PAYMENT_REVISION" ]; then
+      PAYMENT_REVISION=$(git ls-remote "https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.com/cs302-2026/g4-team2/services/payment.git" refs/heads/main | cut -f1)
+    fi
+    if ! echo "$PAYMENT_REVISION" | grep -Eq '^[0-9a-f]{40}$'; then
+      echo "ERROR: could not read the payment project's main commit (got '$PAYMENT_REVISION'): allow this project in its Job token permissions" >&2
+      exit 1
+    fi
+  - IMAGE_URI="$PAYMENT_IMAGE:$PAYMENT_REVISION"
+  - echo "$PAYMENT_REGISTRY_TOKEN" | skopeo login --username "$PAYMENT_REGISTRY_USERNAME" --password-stdin "$CI_REGISTRY"
+  - |
+    if ! skopeo --override-os linux --override-arch amd64 inspect "docker://$IMAGE_URI" > /dev/null; then
+      echo "ERROR: $IMAGE_URI does not exist: that commit's pipeline hasn't released its image (yet)" >&2
+      exit 1
+    fi
+  - VPC_ID=$(aws ec2 describe-vpcs --filters Name=is-default,Values=true --query "Vpcs[0].VpcId" --output text)
+  - |
+    if [ "$VPC_ID" = "None" ]; then
+      echo "ERROR: this region has no default VPC (create one with: aws ec2 create-default-vpc)" >&2
+      exit 1
+    fi
+  - SUBNET_IDS=$(aws ec2 describe-subnets --filters Name=vpc-id,Values="$VPC_ID" Name=default-for-az,Values=true
+      --query "Subnets[].SubnetId" --output text | tr '\t' ',')
+  # Optional stacks: an empty value leaves that feature off (see the template's parameters).
+  - |
+    # A stack without that output (e.g. one that failed to create) prints "None": treat it as missing.
+    stack_output() {
+      value=$(aws cloudformation describe-stacks --stack-name "$STACK_PREFIX-$1" \
+        --query "Stacks[0].Outputs[?OutputKey=='$2'].OutputValue" --output text 2>/dev/null || true)
+      if [ "$value" != "None" ]; then echo "$value"; fi
+    }
+    SERVICES_SG=$(stack_output cluster ServicesSecurityGroupId)
+    NAMESPACE_ID=$(stack_output cluster NamespaceId)
+    # Fallback: true once removes the Cloud Map registration (see README: API Gateway routing).
+    if [ "${SKIP_SERVICE_DISCOVERY:-}" = "true" ]; then NAMESPACE_ID=""; fi
+    PAYMENT_RABBITMQ_HOST="${RABBITMQ_HOST:-$(stack_output rabbitmq Host)}"
+    OTLP_ENDPOINT=$(stack_output observability OtlpEndpoint)
+    SITE_URL=$(stack_output frontend SiteUrl)
+  - echo "Deploying payment $IMAGE_URI to stack $STACK_PREFIX-payment (VPC $VPC_ID, broker '${PAYMENT_RABBITMQ_HOST}')"
+  # Waits until the new task passes its health check; a task that never does is rolled back and fails this job.
+  - aws cloudformation deploy
+      --stack-name "$STACK_PREFIX-payment"
+      --template-file templates/payment.yaml
+      --no-fail-on-empty-changeset
+      --capabilities CAPABILITY_IAM
+      --tags project="$STACK_PREFIX"
+      --parameter-overrides
+      Prefix="$STACK_PREFIX"
+      ImageUri="$IMAGE_URI"
+      RegistryUsername="$PAYMENT_REGISTRY_USERNAME"
+      RegistryToken="$PAYMENT_REGISTRY_TOKEN"
+      VpcId="$VPC_ID"
+      SubnetIds="$SUBNET_IDS"
+      ExecutionRoleArn="${ECS_EXECUTION_ROLE_ARN:-}"
+      RabbitMqHost="$PAYMENT_RABBITMQ_HOST"
+      ServicesSecurityGroupId="$SERVICES_SG"
+      OtlpEndpoint="$OTLP_ENDPOINT"
+      NamespaceId="$NAMESPACE_ID"
+      AllowedOrigin="$SITE_URL"
+  # No load balancer: the API is at the running task's public IP (it changes whenever the task is replaced).
+  - TASK_ARN=$(aws ecs list-tasks --cluster "$STACK_PREFIX-payment" --service-name payment
+      --desired-status RUNNING --query "taskArns[0]" --output text)
+  - |
+    if [ "$TASK_ARN" != "None" ]; then
+      ENI_ID=$(aws ecs describe-tasks --cluster "$STACK_PREFIX-payment" --tasks "$TASK_ARN" \
+        --query "tasks[0].attachments[0].details[?name=='networkInterfaceId'].value" --output text)
+      PUBLIC_IP=$(aws ec2 describe-network-interfaces --network-interface-ids "$ENI_ID" \
+        --query "NetworkInterfaces[0].Association.PublicIp" --output text)
+      echo "Payment Service: http://$PUBLIC_IP:8080 (health: http://$PUBLIC_IP:8080/health)"
+    fi
+    if [ -n "$NAMESPACE_ID" ]; then
+      echo "Inside the VPC: http://payment.$STACK_PREFIX.local:8080 (set EVENTS_PAYMENT_BASE_URL to it, then run deploy-events)"
+    fi
+
+# Deploys the <prefix>-notifications stack (ECS service + its MySQL RDS database, in the default VPC), like payment:
+# main's newest commit of the notifications project (or NOTIFICATIONS_IMAGE_TAG), whose pipeline must have released
+# its image. Needs the secrets stack (the Resend API key set in <prefix>/notifications), a GitLab deploy token on the
+# notifications project (read_registry) in NOTIFICATIONS_REGISTRY_USERNAME / NOTIFICATIONS_REGISTRY_TOKEN, and the
+# notifications project's Job token permissions must allow this project. Optional CI/CD variables:
+# NOTIFICATIONS_ADMIN_EMAIL (admin alerts), NOTIFICATIONS_ALARM_EMAIL (the "email dropped" alarm),
+# NOTIFICATIONS_EMAIL_FROM, NOTIFICATIONS_EMAIL_REDIRECT_TO (testing: every email to one inbox). Uses the cluster,
+# rabbitmq and observability stacks when they exist.
+.deploy-notifications: &deploy-notifications
+  - apt-get install -y -qq skopeo > /dev/null
+  - set -a && . ./config.env && set +a
+  - if [ -z "$AWS_PROFILE" ]; then unset AWS_PROFILE; fi
+  - export AWS_DEFAULT_REGION="$AWS_REGION"
+  - |
+    NOTIFICATIONS_REVISION="${NOTIFICATIONS_IMAGE_TAG:-}"
+    if [ -z "$NOTIFICATIONS_REVISION" ]; then
+      NOTIFICATIONS_REVISION=$(git ls-remote "https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.com/cs302-2026/g4-team2/services/notifications.git" refs/heads/main | cut -f1)
+    fi
+    if ! echo "$NOTIFICATIONS_REVISION" | grep -Eq '^[0-9a-f]{40}$'; then
+      echo "ERROR: could not read the notifications project's main commit (got '$NOTIFICATIONS_REVISION'): allow this project in its Job token permissions" >&2
+      exit 1
+    fi
+  - IMAGE_URI="$NOTIFICATIONS_IMAGE:$NOTIFICATIONS_REVISION"
+  - echo "$NOTIFICATIONS_REGISTRY_TOKEN" | skopeo login --username "$NOTIFICATIONS_REGISTRY_USERNAME" --password-stdin "$CI_REGISTRY"
+  - |
+    if ! skopeo --override-os linux --override-arch amd64 inspect "docker://$IMAGE_URI" > /dev/null; then
+      echo "ERROR: $IMAGE_URI does not exist: that commit's pipeline hasn't released its image (yet)" >&2
+      exit 1
+    fi
+  - VPC_ID=$(aws ec2 describe-vpcs --filters Name=is-default,Values=true --query "Vpcs[0].VpcId" --output text)
+  - |
+    if [ "$VPC_ID" = "None" ]; then
+      echo "ERROR: this region has no default VPC (create one with: aws ec2 create-default-vpc)" >&2
+      exit 1
+    fi
+  - SUBNET_IDS=$(aws ec2 describe-subnets --filters Name=vpc-id,Values="$VPC_ID" Name=default-for-az,Values=true
+      --query "Subnets[].SubnetId" --output text | tr '\t' ',')
+  # Optional stacks: an empty value leaves that feature off (see the template's parameters).
+  - |
+    # A stack without that output (e.g. one that failed to create) prints "None": treat it as missing.
+    stack_output() {
+      value=$(aws cloudformation describe-stacks --stack-name "$STACK_PREFIX-$1" \
+        --query "Stacks[0].Outputs[?OutputKey=='$2'].OutputValue" --output text 2>/dev/null || true)
+      if [ "$value" != "None" ]; then echo "$value"; fi
+    }
+    SERVICES_SG=$(stack_output cluster ServicesSecurityGroupId)
+    NAMESPACE_ID=$(stack_output cluster NamespaceId)
+    if [ "${SKIP_SERVICE_DISCOVERY:-}" = "true" ]; then NAMESPACE_ID=""; fi
+    NOTIFICATIONS_RABBITMQ_HOST="${RABBITMQ_HOST:-$(stack_output rabbitmq Host)}"
+    OTLP_ENDPOINT=$(stack_output observability OtlpEndpoint)
+  - echo "Deploying notifications $IMAGE_URI to stack $STACK_PREFIX-notifications (broker '${NOTIFICATIONS_RABBITMQ_HOST}')"
+  # Waits until the new task passes its health check; a task that never does is rolled back and fails this job.
+  - aws cloudformation deploy
+      --stack-name "$STACK_PREFIX-notifications"
+      --template-file templates/notifications.yaml
+      --no-fail-on-empty-changeset
+      --capabilities CAPABILITY_IAM
+      --tags project="$STACK_PREFIX"
+      --parameter-overrides
+      Prefix="$STACK_PREFIX"
+      ImageUri="$IMAGE_URI"
+      RegistryUsername="$NOTIFICATIONS_REGISTRY_USERNAME"
+      RegistryToken="$NOTIFICATIONS_REGISTRY_TOKEN"
+      VpcId="$VPC_ID"
+      SubnetIds="$SUBNET_IDS"
+      ExecutionRoleArn="${ECS_EXECUTION_ROLE_ARN:-}"
+      RabbitMqHost="$NOTIFICATIONS_RABBITMQ_HOST"
+      ServicesSecurityGroupId="$SERVICES_SG"
+      NamespaceId="$NAMESPACE_ID"
+      OtlpEndpoint="$OTLP_ENDPOINT"
+      AdminEmail="${NOTIFICATIONS_ADMIN_EMAIL:-}"
+      AlarmEmail="${NOTIFICATIONS_ALARM_EMAIL:-}"
+      EmailRedirectTo="${NOTIFICATIONS_EMAIL_REDIRECT_TO:-}"
+      EmailFrom="${NOTIFICATIONS_EMAIL_FROM:-party.fun <onboarding@resend.dev>}"
+  - |
+    if [ -n "$NAMESPACE_ID" ]; then
+      echo "Notification Service API inside the VPC: http://notifications.$STACK_PREFIX.local:5000"
+    fi
+    echo "Logs: CloudWatch log group /ecs/$STACK_PREFIX/notifications"
+
+# Deploys the <prefix>-auth stack (ECS service + its PostgreSQL RDS database, in the default VPC). Like events, the
+# authentication project releases :latest from main, which is resolved to the commit it was built from (or
+# AUTH_IMAGE_TAG if set, any commit whose pipeline built its image). Needs the secrets and cognito stacks and a
+# GitLab deploy token on the authentication project (read_registry) in AUTH_REGISTRY_USERNAME / AUTH_REGISTRY_TOKEN.
+# The service calls the Cognito admin APIs, so it needs a task role: the stack creates one unless ECS_TASK_ROLE_ARN
+# is set (e.g. LabRole). AUTH_ADMIN_EMAIL seeds the ADMIN account (password generated in <prefix>/auth-admin);
+# AUTH_EMAIL_VERIFICATION=true makes new accounts enter the emailed code. Uses the cluster, rabbitmq and frontend
+# stacks when they exist (broker, auth.<prefix>.local, CORS).
+.deploy-auth: &deploy-auth
+  - apt-get install -y -qq skopeo > /dev/null
+  - set -a && . ./config.env && set +a
+  - if [ -z "$AWS_PROFILE" ]; then unset AWS_PROFILE; fi
+  - export AWS_DEFAULT_REGION="$AWS_REGION"
+  - echo "$AUTH_REGISTRY_TOKEN" | skopeo login --username "$AUTH_REGISTRY_USERNAME" --password-stdin "$CI_REGISTRY"
+  - |
+    AUTH_REVISION="${AUTH_IMAGE_TAG:-}"
+    if [ -z "$AUTH_REVISION" ]; then
+      AUTH_REVISION=$(skopeo --override-os linux --override-arch amd64 inspect \
+        --format '{{ index .Labels "org.opencontainers.image.revision" }}' "docker://$AUTH_IMAGE:latest")
+    fi
+    if ! echo "$AUTH_REVISION" | grep -Eq '^[0-9a-f]{40}$'; then
+      echo "ERROR: no commit to deploy (got '$AUTH_REVISION'): $AUTH_IMAGE:latest needs an org.opencontainers.image.revision label" >&2
+      exit 1
+    fi
+  - IMAGE_URI="$AUTH_IMAGE:$AUTH_REVISION"
+  - |
+    if ! skopeo --override-os linux --override-arch amd64 inspect "docker://$IMAGE_URI" > /dev/null; then
+      echo "ERROR: $IMAGE_URI does not exist: that commit's pipeline hasn't built its image (yet)" >&2
+      exit 1
+    fi
+  - VPC_ID=$(aws ec2 describe-vpcs --filters Name=is-default,Values=true --query "Vpcs[0].VpcId" --output text)
+  - |
+    if [ "$VPC_ID" = "None" ]; then
+      echo "ERROR: this region has no default VPC (create one with: aws ec2 create-default-vpc)" >&2
+      exit 1
+    fi
+  - SUBNET_IDS=$(aws ec2 describe-subnets --filters Name=vpc-id,Values="$VPC_ID" Name=default-for-az,Values=true
+      --query "Subnets[].SubnetId" --output text | tr '\t' ',')
+  # Optional stacks: an empty value leaves that feature off (see the template's parameters).
+  - |
+    # A stack without that output (e.g. one that failed to create) prints "None": treat it as missing.
+    stack_output() {
+      value=$(aws cloudformation describe-stacks --stack-name "$STACK_PREFIX-$1" \
+        --query "Stacks[0].Outputs[?OutputKey=='$2'].OutputValue" --output text 2>/dev/null || true)
+      if [ "$value" != "None" ]; then echo "$value"; fi
+    }
+    SERVICES_SG=$(stack_output cluster ServicesSecurityGroupId)
+    NAMESPACE_ID=$(stack_output cluster NamespaceId)
+    # Fallback: true once removes the Cloud Map registration (see README: API Gateway routing).
+    if [ "${SKIP_SERVICE_DISCOVERY:-}" = "true" ]; then NAMESPACE_ID=""; fi
+    AUTH_RABBITMQ_HOST="${RABBITMQ_HOST:-$(stack_output rabbitmq Host)}"
+    OTLP_ENDPOINT=$(stack_output observability OtlpEndpoint)
+    SITE_URL=$(stack_output frontend SiteUrl)
+  - echo "Deploying auth $IMAGE_URI to stack $STACK_PREFIX-auth (VPC $VPC_ID, broker '${AUTH_RABBITMQ_HOST}')"
+  # Waits until the new task passes its health check; a task that never does is rolled back and fails this job.
+  - aws cloudformation deploy
+      --stack-name "$STACK_PREFIX-auth"
+      --template-file templates/auth.yaml
+      --no-fail-on-empty-changeset
+      --capabilities CAPABILITY_IAM
+      --tags project="$STACK_PREFIX"
+      --parameter-overrides
+      Prefix="$STACK_PREFIX"
+      ImageUri="$IMAGE_URI"
+      RegistryUsername="$AUTH_REGISTRY_USERNAME"
+      RegistryToken="$AUTH_REGISTRY_TOKEN"
+      VpcId="$VPC_ID"
+      SubnetIds="$SUBNET_IDS"
+      ExecutionRoleArn="${ECS_EXECUTION_ROLE_ARN:-}"
+      TaskRoleArn="${ECS_TASK_ROLE_ARN:-}"
+      RabbitMqHost="$AUTH_RABBITMQ_HOST"
+      ServicesSecurityGroupId="$SERVICES_SG"
+      OtlpEndpoint="$OTLP_ENDPOINT"
+      NamespaceId="$NAMESPACE_ID"
+      AllowedOrigin="$SITE_URL"
+      EmailVerification="${AUTH_EMAIL_VERIFICATION:-false}"
+      AdminEmail="${AUTH_ADMIN_EMAIL:-}"
+  # No load balancer: the API is at the running task's public IP (it changes whenever the task is replaced).
+  - TASK_ARN=$(aws ecs list-tasks --cluster "$STACK_PREFIX-auth" --service-name auth
+      --desired-status RUNNING --query "taskArns[0]" --output text)
+  - |
+    if [ "$TASK_ARN" != "None" ]; then
+      ENI_ID=$(aws ecs describe-tasks --cluster "$STACK_PREFIX-auth" --tasks "$TASK_ARN" \
+        --query "tasks[0].attachments[0].details[?name=='networkInterfaceId'].value" --output text)
+      PUBLIC_IP=$(aws ec2 describe-network-interfaces --network-interface-ids "$ENI_ID" \
+        --query "NetworkInterfaces[0].Association.PublicIp" --output text)
+      echo "Authentication Service: http://$PUBLIC_IP:8080 (health: http://$PUBLIC_IP:8080/actuator/health)"
+    fi
+    if [ -n "$NAMESPACE_ID" ]; then
+      echo "Inside the VPC: http://auth.$STACK_PREFIX.local:8080"
+    fi
+
+deploy-all:
+  extends: .deploy
+  script:
+    - *clone-frontend
+    - bash deploy.sh --yes
+    - *deploy-events
+    - *deploy-payment
+    - *deploy-auth
+    - *deploy-notifications
+
+deploy-secrets:
+  extends: .deploy
+  script:
+    - bash deploy.sh --yes secrets
+
+# A Cognito change always needs the API's JWT authorizer updated too.
+deploy-cognito-api:
+  extends: .deploy
+  script:
+    - bash deploy.sh --yes cognito api
+
+# The ECS cluster (and its namespace / security group) and the RabbitMQ broker that runs in it.
+deploy-cluster-rabbitmq:
+  extends: .deploy
+  script:
+    - bash deploy.sh --yes cluster rabbitmq
+
+# The OpenTelemetry Collector and Jaeger (needs the cluster).
+deploy-observability:
+  extends: .deploy
+  script:
+    - bash deploy.sh --yes observability
+
+deploy-frontend:
+  extends: .deploy
+  script:
+    - bash deploy.sh --yes frontend
+
+deploy-api:
+  extends: .deploy
+  script:
+    - bash deploy.sh --yes api
+
+deploy-site:
+  extends: .deploy
+  script:
+    - *clone-frontend
+    - bash deploy.sh --yes site
+
+deploy-events:
+  extends: .deploy
+  script:
+    - *deploy-events
+
+deploy-payment:
+  extends: .deploy
+  script:
+    - *deploy-payment
+
+deploy-auth:
+  extends: .deploy
+  script:
+    - *deploy-auth
+
+deploy-notifications:
+  extends: .deploy
+  script:
+    - *deploy-notifications
+
+# The AWS FIS experiment templates and their money-at-risk stop condition (needs the cluster, rabbitmq, events and
+# payment stacks).
+deploy-chaos:
+  extends: .deploy
+  script:
+    - bash deploy.sh --yes chaos
+
+# Chaos engineering: each job runs one AWS FIS experiment (templates/chaos.yaml) with chaos/run.mjs, which sends real
+# test traffic during the fault (Stripe sandbox, SGD 1.00) and fails unless every payment it made ends refunded or
+# never charged, nobody is charged twice, and the services recover by themselves. chaos-check only checks the setup.
+# chaos-all runs the check and then every experiment, in order, with a summary; a pipeline schedule with
+# CHAOS_EXPERIMENTS=true runs it. The other jobs are manual on main. The resource_group runs one at a time.
+# Needs deploy-chaos, and two test accounts in masked CI/CD variables: CHAOS_ORGANISER_USERNAME /
+# CHAOS_ORGANISER_PASSWORD (organiser group) and CHAOS_PARTICIPANT_USERNAME / CHAOS_PARTICIPANT_PASSWORD. The network
+# experiments (payment-unreachable, payment-slow) also need EVENTS_FAULT_INJECTION=true and deploy-events run with it;
+# chaos-all skips them until then.
+.chaos:
+  extends: .deploy
+  stage: chaos
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE != "schedule"
+      when: manual
+  timeout: 45m
+  script:
+    - set -a && . ./config.env && set +a
+    - if [ -z "$AWS_PROFILE" ]; then unset AWS_PROFILE; fi
+    - export AWS_DEFAULT_REGION="$AWS_REGION"
+    - node chaos/run.mjs "$CHAOS_EXPERIMENT"
+
+# Usually 10 min per experiment; at worst about 35 (up to 10 min each for the steady state, the recovery and the
+# refunds), hence the GitLab.com maximum.
+chaos-all:
+  extends: .chaos
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule" && $CHAOS_EXPERIMENTS == "true"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE != "schedule"
+      when: manual
+  timeout: 3h
+  variables:
+    CHAOS_EXPERIMENT: all
+
+chaos-check:
+  extends: .chaos
+  variables:
+    CHAOS_EXPERIMENT: check
+
+chaos-payment-down:
+  extends: .chaos
+  variables:
+    CHAOS_EXPERIMENT: payment-down
+
+chaos-broker-down:
+  extends: .chaos
+  variables:
+    CHAOS_EXPERIMENT: broker-down
+
+chaos-events-crash:
+  extends: .chaos
+  variables:
+    CHAOS_EXPERIMENT: events-crash
+
+chaos-payment-unreachable:
+  extends: .chaos
+  variables:
+    CHAOS_EXPERIMENT: payment-unreachable
+
+chaos-payment-slow:
+  extends: .chaos
+  variables:
+    CHAOS_EXPERIMENT: payment-slow

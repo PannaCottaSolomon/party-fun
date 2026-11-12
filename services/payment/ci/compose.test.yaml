@@ -1,0 +1,109 @@
+# Docker integration-test environment (used locally and by the GitLab integration-tests job):
+#
+#   docker compose -f ci/compose.test.yaml up --build --abort-on-container-exit --exit-code-from tests
+#   docker compose -f ci/compose.test.yaml down -v --remove-orphans
+#
+# Everything is throw-away: a fresh MySQL (official image) and RabbitMQ, WireMock standing in for api.stripe.com, the
+# Payment Service built from this repo with the "test" profile, and a Maven container that runs the black-box JUnit
+# integration tests (src/test/java/payment/integration/*IT.java) with Failsafe. No ports are published, so nothing
+# clashes with a local MySQL on 3306.
+#
+# No Stripe key and no internet needed: the Payment Service's Stripe calls go to the wiremock container
+# (stripe_api_base, read only by the test profile), which answers with the stubs in ci/wiremock/mappings. The tests
+# set up special cases (a charge already refunded, a PaymentIntent confirmed in the browser, transient Stripe errors)
+# through WireMock's admin API. The running service itself (local stack, AWS) always calls the real Stripe sandbox.
+# The tests send the webhooks themselves, signed with the throw-away secret below (an HMAC key shared by the two
+# containers, not a Stripe credential).
+
+name: payment-integration
+
+services:
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_DATABASE: payment
+      MYSQL_USER: g4t2
+      MYSQL_PASSWORD: g4t2
+      MYSQL_ROOT_PASSWORD: root
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-proot"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  # api.stripe.com stand-in: default answers from ci/wiremock/mappings, per-test answers added by the tests.
+  wiremock:
+    image: wiremock/wiremock:3.13.2
+    command: ["--global-response-templating", "--disable-banner"]
+    volumes:
+      - ./wiremock:/home/wiremock:ro
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:8080/__admin/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  payment:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    environment:
+      stage: test
+      db_user: g4t2
+      db_password: g4t2
+      rabbitmq_host: rabbitmq
+      rabbitmq_port: "5672"
+      rabbitmq_username: guest
+      rabbitmq_password: guest
+      # Stripe is WireMock here: a dummy sandbox-shaped key (the service still refuses anything but sk_test_).
+      stripe_secret_key: sk_test_wiremock
+      stripe_api_base: http://wiremock:8080
+      stripe_webhook_secret: it-webhook-signing-secret
+      # Throw-away credentials for the Admin and refund endpoints; the tests container uses the same values. The JWT
+      # secret plays the JWT issuer's shared secret: the tests mint ADMIN / PARTICIPANT tokens with it.
+      auth_jwt_secret: it-jwt-secret-only-for-integration-tests-32b
+      payment_admin_api_key: it-admin-key
+      payment_service_api_key: it-service-key
+      # The DLQ count for the Admin dashboard comes from the RabbitMQ management API.
+      rabbitmq_management_url: http://rabbitmq:15672
+    depends_on:
+      mysql:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      wiremock:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 40
+      start_period: 15s
+
+  tests:
+    build:
+      context: ..
+      dockerfile: ci/Dockerfile.test
+    environment:
+      PAYMENT_URL: http://payment:8080
+      RABBITMQ_API: http://rabbitmq:15672
+      RABBITMQ_USER: guest
+      RABBITMQ_PASSWORD: guest
+      JWT_SECRET: it-jwt-secret-only-for-integration-tests-32b
+      ADMIN_API_KEY: it-admin-key
+      SERVICE_API_KEY: it-service-key
+      # WireMock's admin API: the tests set up Stripe's side of special cases and count Stripe calls there.
+      WIREMOCK_URL: http://wiremock:8080
+      WEBHOOK_SECRET: it-webhook-signing-secret
+    depends_on:
+      payment:
+        condition: service_healthy

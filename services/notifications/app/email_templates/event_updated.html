@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+{% block heading %}Event updated{% endblock %}
+{% block body %}
+{% if audience == "participant" %}
+<p>The organiser has changed some details of <strong>{{ event_title }}</strong>, an event you've signed up for.</p>
+{% else %}
+<p>Your changes to <strong>{{ event_title }}</strong> have been saved, and registered participants have been notified.</p>
+{% endif %}
+<p><strong>What changed:</strong></p>
+<ul>
+{% if changes is mapping %}
+  {% for field, value in changes.items() %}<li>{{ field | replace("_", " ") | capitalize }}: {{ value }}</li>
+  {% endfor %}
+{% else %}
+  {% for change in changes %}<li>{{ change }}</li>
+  {% endfor %}
+{% endif %}
+</ul>
+{% endblock %}

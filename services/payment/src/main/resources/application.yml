@@ -1,0 +1,141 @@
+# Payment Service configuration.
+#
+# Every value comes from an environment variable named like the course dev.env (db_host, stripe_secret_key...).
+# For local runs, a ./dev.env file (copy dev.env.example) is also read automatically; real env vars win.
+# Profiles: stage=dev (default; local MySQL, schema validate only) or stage=test (Docker integration tests).
+
+spring:
+  application:
+    name: payment
+  config:
+    import: optional:file:./dev.env[.properties]
+  profiles:
+    active: ${stage:dev}
+  datasource:
+    url: jdbc:mysql://${db_host:localhost}:${db_port:3306}/${db_name:payment}
+    username: ${db_user:}
+    password: ${db_password:}
+  jpa:
+    open-in-view: false
+    hibernate:
+      # Never create/drop tables against a real database. The test profile overrides this for Docker MySQL only.
+      ddl-auto: validate
+  rabbitmq:
+    host: ${rabbitmq_host:localhost}
+    port: ${rabbitmq_port:5672}
+    username: ${rabbitmq_username:guest}
+    password: ${rabbitmq_password:guest}
+    # The broker confirms every failed-refund message published to the refund dead-letter exchange, so a failed
+    # refund is never silently lost between Payment and payments.refunds.dlq. (Redelivery of event.cancelled
+    # after an unexpected error is configured on its listener container in RabbitConfig.)
+    publisher-confirm-type: simple
+    # Carry the trace across RabbitMQ: publishing adds a traceparent header, consuming continues that trace.
+    template:
+      observation-enabled: true
+    listener:
+      simple:
+        observation-enabled: true
+
+server:
+  port: ${port:8080}
+  error:
+    include-stacktrace: never
+    include-message: never
+
+# Spring Actuator: ONLY the health endpoint is exposed, without details (no versions, hosts or errors leak).
+#   /actuator/health             UP when MySQL and RabbitMQ are reachable (CI smoke test)
+#   /actuator/health/liveness    the process is alive (Docker HEALTHCHECK, Kubernetes liveness/startup probes)
+#   /actuator/health/readiness   ready for traffic: MySQL and RabbitMQ reachable (Kubernetes readiness probe)
+# Stripe is deliberately not part of readiness: a Stripe outage must not take every pod out of service
+# (payment calls already answer 502 then).
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health
+  endpoint:
+    health:
+      show-details: never
+      probes:
+        enabled: true
+      group:
+        readiness:
+          include: readinessState,db,rabbit
+  # Distributed tracing (OpenTelemetry -> Jaeger): every HTTP request and RabbitMQ message becomes a span,
+  # and log lines carry the trace id. OTEL_EXPORTER_OTLP_ENDPOINT is Jaeger's OTLP/HTTP address
+  # (http://jaeger.<namespace>:4318 on AWS); Spring's default would keep only 10% of traces, hence 1.0.
+  tracing:
+    sampling:
+      probability: ${TRACING_SAMPLING_PROBABILITY:1.0}
+  opentelemetry:
+    tracing:
+      export:
+        otlp:
+          endpoint: ${OTEL_EXPORTER_OTLP_ENDPOINT:http://localhost:4318}/v1/traces
+  otlp:
+    metrics:
+      export:
+        enabled: false   # traces only: metrics aren't collected
+
+payment:
+  refund:
+    max-attempts: ${refund_max_attempts:3}
+    backoff-ms: ${refund_backoff_ms:1000}
+  admin-alert:
+    enabled: ${admin_alert_enabled:true}
+  messaging:
+    # Target architecture: 4 exchanges (incl. the default one) and 6 queues in total. Payment declares only its
+    # own 2 queues (payments.refunds.requested, payments.refunds.dlq) and 3 exchanges; the 4 notification queues
+    # belong to the Notification Service.
+    exchange: party.events
+    # Published by the Event Service after it cancels an event; Payment then refunds each paid payment itself.
+    event-cancelled-routing-key: event.cancelled
+    refund-requested-queue: payments.refunds.requested
+    # A refund that still fails after its attempts is published here by Payment itself (application-managed
+    # routing: one message per failed payment), and stays in the DLQ until an Admin recovers it.
+    refund-dead-letter-exchange: payments.refund.dlx
+    refund-dead-letter-queue: payments.refunds.dlq
+    # Existing Notification Service contract (services/notifications): topic exchange + notify.<type> keys.
+    # Its queues (notifications_service and the retry queues) belong to the Notification Service, not to us.
+    notification-exchange: ${notification_exchange:notifications}
+    # Participant email after a refund succeeds (sent directly; no payments.refunded round trip).
+    refund-notification-routing-key: notify.refund
+    # IT Support / Admin email after refund attempts are exhausted.
+    admin-alert-routing-key: notify.admin_alert
+    # RabbitMQ management HTTP API, used only to show the DLQ's ready/unacknowledged counts to the Admin.
+    management-url: ${rabbitmq_management_url:http://${rabbitmq_host:localhost}:15672}
+  # A REFUND_PENDING payment with no Stripe refund that hasn't changed for this long was abandoned (e.g. the
+  # service stopped mid-refund); RefundRecoveryJob resumes it with the same idempotency key.
+  recovery:
+    stale-after: ${refund_recovery_stale_after:PT10M}
+    interval: ${refund_recovery_interval:PT5M}
+  # Admin endpoints accept an Admin JWT (see auth.jwt below). This shared secret (X-Admin-Api-Key header) is the
+  # operator fallback, e.g. while the JWT issuer can't issue ADMIN tokens yet. Empty = the fallback is off.
+  admin-api-key: ${payment_admin_api_key:${PAYMENT_ADMIN_API_KEY:}}
+  # Separate secret for internal service-to-service refunds (X-Service-Api-Key header), e.g. the Event Service's
+  # compensation refund. Accepted only on POST /payments/{id}/refund; must differ from the admin key.
+  service-api-key: ${payment_service_api_key:${PAYMENT_SERVICE_API_KEY:}}
+
+# Stripe TEST mode only (sk_test_...). The upper-case names are accepted too (STRIPE_SECRET_KEY, ...).
+stripe:
+  secret-key: ${stripe_secret_key:${STRIPE_SECRET_KEY:}}
+  webhook-secret: ${stripe_webhook_secret:${STRIPE_WEBHOOK_SECRET:}}
+  # Public sandbox key (pk_test_...) for the frontend's Stripe.js card form; served by GET /payments/config.
+  publishable-key: ${stripe_publishable_key:${STRIPE_PUBLISHABLE_KEY:}}
+
+cors:
+  allowed-origins: ${cors_allowed_origins:http://localhost:5173}
+
+# Admin authorisation: HS256 JWTs from the JWT issuer (today the Authentication Service; later the combined
+# Event/Authentication service). Verified locally with the shared secret; Payment never calls the issuer.
+# A token must carry role=ADMIN. Empty secret = JWTs are not accepted (only the operator API key works).
+auth:
+  jwt:
+    secret: ${auth_jwt_secret:${AUTH_JWT_SECRET:}}
+    # Optional: when set, the token's "iss" claim must equal it. Today's tokens have no issuer.
+    issuer: ${auth_jwt_issuer:${AUTH_JWT_ISSUER:}}
+  # Admin login through the API Gateway: Amazon Cognito access tokens of users in the "admin" group, verified with the
+  # user pool's public keys (fetched from Cognito). Empty user pool id = off (Cognito tokens are not accepted).
+  cognito:
+    region: ${AWS_REGION:ap-southeast-1}
+    user-pool-id: ${COGNITO_USER_POOL_ID:}

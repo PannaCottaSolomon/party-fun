@@ -1,0 +1,82 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: auth-service
+
+  datasource:
+    url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5432}/${DB_NAME:authdb}
+    username: ${DB_USERNAME:postgres}
+    password: ${DB_PASSWORD:postgres}
+
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: update   # fine for coursework; use migrations (Flyway/Liquibase) for anything longer-lived
+    show-sql: false
+    properties:
+      hibernate:
+        format_sql: true
+
+  rabbitmq:
+    host: ${RABBITMQ_HOST:localhost}
+    port: ${RABBITMQ_PORT:5672}
+    username: ${RABBITMQ_USERNAME:guest}
+    password: ${RABBITMQ_PASSWORD:guest}
+    # Carry the trace across RabbitMQ: publishing adds a traceparent header, consuming continues that trace.
+    template:
+      observation-enabled: true
+    listener:
+      simple:
+        observation-enabled: true
+
+auth:
+  cognito:
+    # The team's Cognito user pool: the same AWS_REGION / COGNITO_USER_POOL_ID as the events service.
+    # Token lifetimes (access 1 h, refresh 30 days by default) are set on the app client in Cognito.
+    region: ${AWS_REGION:ap-southeast-1}
+    user-pool-id: ${COGNITO_USER_POOL_ID:}
+    # The frontend's app client (tokens from other clients are rejected): no client secret,
+    # ALLOW_USER_PASSWORD_AUTH and ALLOW_REFRESH_TOKEN_AUTH.
+    client-id: ${COGNITO_CLIENT_ID:}
+  features:
+    # EMAIL_VERIFICATION_ENABLED: must a new account enter the code Cognito emails? Off for now: the frontend
+    # confirms new accounts without it (POST /auth/confirm-sign-up). Turn on before real users sign up.
+    email-verification: ${EMAIL_VERIFICATION_ENABLED:false}
+  cors:
+    # Browser origins allowed to call this API, comma-separated (the frontend's dev server by default).
+    allowed-origins: ${CORS_ALLOWED_ORIGINS:http://localhost:5173}
+  admin:
+    # The single platform ADMIN account, seeded into Cognito (group "admin") on startup (see AdminBootstrap).
+    # ADMIN can never be chosen by a user. Log in with this email (or username) + password. The password must meet
+    # the user pool's password policy.
+    # The password is intentionally NOT defaulted here: supply it via ADMIN_BOOTSTRAP_PASSWORD
+    # (local dev reads it from .env — see .env.example). A blank password skips seeding.
+    email: ${ADMIN_BOOTSTRAP_EMAIL:admin@partyfun.local}
+    # Cognito username of the admin. Empty = the email (pool that signs in with email). For a pool that signs
+    # in with usernames (email as an alias), set a plain one, e.g. admin.
+    username: ${ADMIN_BOOTSTRAP_USERNAME:}
+    password: ${ADMIN_BOOTSTRAP_PASSWORD:}
+    full-name: ${ADMIN_BOOTSTRAP_NAME:Platform Admin}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  # Distributed tracing (OpenTelemetry -> Jaeger): every HTTP request and RabbitMQ message becomes a span,
+  # and log lines carry the trace id. OTEL_EXPORTER_OTLP_ENDPOINT is Jaeger's OTLP/HTTP address
+  # (http://jaeger.<namespace>:4318 on AWS); Spring's default would keep only 10% of traces, hence 1.0.
+  tracing:
+    sampling:
+      probability: ${TRACING_SAMPLING_PROBABILITY:1.0}
+  opentelemetry:
+    tracing:
+      export:
+        otlp:
+          endpoint: ${OTEL_EXPORTER_OTLP_ENDPOINT:http://localhost:4318}/v1/traces
+  otlp:
+    metrics:
+      export:
+        enabled: false   # traces only: metrics aren't collected

@@ -1,0 +1,13 @@
+{
+  "name": "GET /payments/booking/{bookingId}: no payments. The stub keeps no state; a test that needs the payments of a booking (lost answers, refund states) stubs them itself",
+  "priority": 5,
+  "request": {
+    "method": "GET",
+    "urlPathPattern": "/payments/booking/[0-9]+"
+  },
+  "response": {
+    "status": 200,
+    "headers": { "Content-Type": "application/json" },
+    "body": "[]"
+  }
+}

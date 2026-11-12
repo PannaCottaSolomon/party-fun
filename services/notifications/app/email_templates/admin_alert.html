@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% block heading %}Action needed: {{ source }}{% endblock %}
+{% block body %}
+<p>A message was moved to a dead-letter queue and needs manual attention.</p>
+<table role="presentation" cellpadding="0" cellspacing="0" style="margin:16px 0;">
+  <tr><td style="padding:4px 16px 4px 0;color:#7b8794;">Source</td><td>{{ source }}</td></tr>
+  <tr><td style="padding:4px 16px 4px 0;color:#7b8794;">Error</td><td>{{ error }}</td></tr>
+</table>
+{% if details %}
+<p><strong>Details:</strong></p>
+<pre style="background:#f4f4f7;padding:12px;border-radius:6px;font-size:13px;white-space:pre-wrap;">{{ details | pretty }}</pre>
+{% endif %}
+{% endblock %}

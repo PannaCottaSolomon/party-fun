@@ -1,0 +1,285 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  party.fun message broker: RabbitMQ as an ECS Fargate service. Queued messages survive restarts and redeploys (EFS),
+  services connect to rabbitmq.<Prefix>.local:5672 with the partyfun/rabbitmq credentials, and only the services'
+  security group can reach it. Exchanges and queues are not created here: each service declares its own on startup.
+
+Parameters:
+  Prefix:
+    Type: String
+    Default: partyfun
+    AllowedPattern: '[a-z][a-z0-9-]{1,30}'
+    Description: Name prefix for every resource and export (lowercase).
+  RabbitMqImage:
+    Type: String
+    Default: rabbitmq:4.3-management
+    Description: Pin a version; changing it is a broker upgrade (one task at a time, queued messages are kept).
+  AdminCidr:
+    Type: String
+    Default: 127.0.0.1/32
+    AllowedPattern: '(\d{1,3}\.){3}\d{1,3}/\d{1,2}'
+    Description: >-
+      Your IP as x.x.x.x/32, allowed to open the management UI (15672) and connect on 5672 for testing. The default
+      allows no one.
+  AssignPublicIp:
+    Type: String
+    Default: ENABLED
+    AllowedValues: [ENABLED, DISABLED]
+    Description: ENABLED in public subnets (to pull the image from Docker Hub); DISABLED in private subnets with a NAT.
+
+Resources:
+  # ------------------------------------------------------------------------------------------------- network
+  BrokerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub ${Prefix} RabbitMQ broker
+      VpcId: !ImportValue
+        Fn::Sub: ${Prefix}-vpc-id
+      SecurityGroupIngress:
+        - Description: AMQP from the backend services
+          IpProtocol: tcp
+          FromPort: 5672
+          ToPort: 5672
+          SourceSecurityGroupId: !ImportValue
+            Fn::Sub: ${Prefix}-services-sg-id
+        - Description: AMQP from the admin IP (testing)
+          IpProtocol: tcp
+          FromPort: 5672
+          ToPort: 5672
+          CidrIp: !Ref AdminCidr
+        - Description: Management UI from the admin IP
+          IpProtocol: tcp
+          FromPort: 15672
+          ToPort: 15672
+          CidrIp: !Ref AdminCidr
+      Tags:
+        - Key: Name
+          Value: !Sub ${Prefix}-rabbitmq
+
+  EfsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub ${Prefix} RabbitMQ data (EFS)
+      VpcId: !ImportValue
+        Fn::Sub: ${Prefix}-vpc-id
+      SecurityGroupIngress:
+        - Description: NFS from the broker only
+          IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          SourceSecurityGroupId: !Ref BrokerSecurityGroup
+
+  # ----------------------------------------------------------------------------------------------- storage
+  # A Fargate task's own disk is wiped whenever the task is replaced (deploy, crash, AWS maintenance), which would lose
+  # every queued message, including emails waiting in the retry queues. /var/lib/rabbitmq lives on EFS instead.
+  DataFileSystem:
+    Type: AWS::EFS::FileSystem
+    DeletionPolicy: Retain          # keep the data if the stack is deleted; delete the file system by hand
+    UpdateReplacePolicy: Retain
+    Properties:
+      Encrypted: true
+      PerformanceMode: generalPurpose
+      FileSystemTags:
+        - Key: Name
+          Value: !Sub ${Prefix}-rabbitmq-data
+
+  # One mount target per subnet the broker can run in (the first two of the cluster's subnets). A task can only mount
+  # EFS in an Availability Zone that has a mount target, so the service below uses exactly these two subnets.
+  MountTargetA:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref DataFileSystem
+      SubnetId: !Select [0, !Split [',', !ImportValue {'Fn::Sub': '${Prefix}-subnet-ids'}]]
+      SecurityGroups: [!Ref EfsSecurityGroup]
+  MountTargetB:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref DataFileSystem
+      SubnetId: !Select [1, !Split [',', !ImportValue {'Fn::Sub': '${Prefix}-subnet-ids'}]]
+      SecurityGroups: [!Ref EfsSecurityGroup]
+
+  # The rabbitmq image runs as uid/gid 999, so its data folder must belong to that user.
+  DataAccessPoint:
+    Type: AWS::EFS::AccessPoint
+    Properties:
+      FileSystemId: !Ref DataFileSystem
+      PosixUser:
+        Uid: '999'
+        Gid: '999'
+      RootDirectory:
+        Path: /rabbitmq
+        CreationInfo:
+          OwnerUid: '999'
+          OwnerGid: '999'
+          Permissions: '0750'
+
+  # ------------------------------------------------------------------------------------------------- roles
+  # Used by ECS to start the task: pull the image, write logs, read the broker login from Secrets Manager.
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: read-rabbitmq-secret
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !ImportValue
+                  Fn::Sub: ${Prefix}-rabbitmq-secret-arn
+
+  # Used by the running broker. Only for ECS Exec (`aws ecs execute-command`, to run rabbitmqctl inside the task).
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ecs-exec
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssmmessages:CreateControlChannel
+                  - ssmmessages:CreateDataChannel
+                  - ssmmessages:OpenControlChannel
+                  - ssmmessages:OpenDataChannel
+                Resource: '*'
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/${Prefix}/rabbitmq
+      RetentionInDays: 14
+
+  # ------------------------------------------------------------------------------------------------ broker
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub ${Prefix}-rabbitmq
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: '512'
+      Memory: '1024'
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      Volumes:
+        - Name: rabbitmq-data
+          EFSVolumeConfiguration:
+            FilesystemId: !Ref DataFileSystem
+            TransitEncryption: ENABLED
+            AuthorizationConfig:
+              AccessPointId: !Ref DataAccessPoint
+      ContainerDefinitions:
+        - Name: rabbitmq
+          Image: !Ref RabbitMqImage
+          Essential: true
+          PortMappings:
+            - { ContainerPort: 5672, Protocol: tcp }
+            - { ContainerPort: 15672, Protocol: tcp }
+          Environment:
+            # RabbitMQ keeps its data in a folder named after the node, and the default node name contains the
+            # hostname, which is different for every Fargate task. A fixed name lets a new task find the old data.
+            - Name: RABBITMQ_NODENAME
+              Value: rabbit@localhost
+          Secrets:
+            # Only used the first time, when the data folder is empty; afterwards the user lives in the data on EFS.
+            - Name: RABBITMQ_DEFAULT_USER
+              ValueFrom: !Sub
+                - '${SecretArn}:username::'
+                - SecretArn: !ImportValue
+                    Fn::Sub: ${Prefix}-rabbitmq-secret-arn
+            - Name: RABBITMQ_DEFAULT_PASS
+              ValueFrom: !Sub
+                - '${SecretArn}:password::'
+                - SecretArn: !ImportValue
+                    Fn::Sub: ${Prefix}-rabbitmq-secret-arn
+          MountPoints:
+            - SourceVolume: rabbitmq-data
+              ContainerPath: /var/lib/rabbitmq
+          HealthCheck:
+            Command: [CMD-SHELL, rabbitmq-diagnostics -q ping]
+            Interval: 30
+            Timeout: 10
+            Retries: 3
+            StartPeriod: 60
+          # Time to finish writing to disk before being killed on a deploy.
+          StopTimeout: 60
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: rabbitmq
+
+  # rabbitmq.<Prefix>.local -> the broker task's private IP
+  DiscoveryService:
+    Type: AWS::ServiceDiscovery::Service
+    Properties:
+      Name: rabbitmq
+      NamespaceId: !ImportValue
+        Fn::Sub: ${Prefix}-namespace-id
+      DnsConfig:
+        DnsRecords:
+          - Type: A
+            TTL: 10
+      HealthCheckCustomConfig:
+        FailureThreshold: 1
+
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn: [MountTargetA, MountTargetB]
+    Properties:
+      ServiceName: rabbitmq
+      Cluster: !ImportValue
+        Fn::Sub: ${Prefix}-cluster-name
+      LaunchType: FARGATE
+      PlatformVersion: LATEST
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: 1
+      EnableExecuteCommand: true
+      # Exactly one broker at a time: on a deploy the old task stops before the new one starts, so two brokers never
+      # write to the same data. The broker is down for about a minute; the services reconnect on their own.
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 0
+        MaximumPercent: 100
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: !Ref AssignPublicIp
+          Subnets:
+            - !Select [0, !Split [',', !ImportValue {'Fn::Sub': '${Prefix}-subnet-ids'}]]
+            - !Select [1, !Split [',', !ImportValue {'Fn::Sub': '${Prefix}-subnet-ids'}]]
+          SecurityGroups: [!Ref BrokerSecurityGroup]
+      ServiceRegistries:
+        - RegistryArn: !GetAtt DiscoveryService.Arn
+
+Outputs:
+  Host:
+    Description: Where the services connect (inside the VPC)
+    # Same name the cluster stack gives the namespace (${Prefix}.local). Written out rather than imported: cfn-lint
+    # (W6001) rejects exporting a value that is itself an import.
+    Value: !Sub rabbitmq.${Prefix}.local
+    Export:
+      Name: !Sub ${Prefix}-rabbitmq-host
+  Port:
+    Value: '5672'
+    Export:
+      Name: !Sub ${Prefix}-rabbitmq-port
+  LogGroup:
+    Value: !Ref LogGroup

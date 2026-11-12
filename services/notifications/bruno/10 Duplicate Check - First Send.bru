@@ -1,0 +1,42 @@
+meta {
+  name: Duplicate Check - First Send
+  type: http
+  seq: 10
+}
+
+post {
+  url: {{baseUrl}}/notify_refund
+  body: json
+  auth: none
+}
+
+headers {
+  X-API-Key: {{apiKey}}
+}
+
+body:json {
+  {
+    "notification_id": "dup-check-{{runId}}",
+    "email": "participant@example.com",
+    "name": "Alex",
+    "event_title": "Off-campus Beach Day",
+    "amount": 1500,
+    "currency": "SGD",
+    "registration_id": 1001,
+    "refund_id": "re_3Pxyz"
+  }
+}
+
+script:pre-request {
+  bru.setVar("runId", Date.now());
+}
+
+assert {
+  res.status: eq 200
+  res.body.status: eq sent
+}
+
+docs {
+  Sends a refund email with a fixed notification_id.
+  The next request repeats it and should be skipped as a duplicate.
+}

@@ -1,0 +1,17 @@
+{
+  "name": "POST /payments/{paymentId}/refund with the internal service key: REFUNDED",
+  "priority": 5,
+  "request": {
+    "method": "POST",
+    "urlPathPattern": "/payments/[0-9]+/refund",
+    "headers": {
+      "X-Service-Api-Key": { "matches": ".+" }
+    }
+  },
+  "response": {
+    "status": 200,
+    "headers": { "Content-Type": "application/json" },
+    "body": "{\"paymentId\": {{request.pathSegments.[1]}}, \"outcome\": \"REFUNDED\", \"paymentStatus\": \"REFUNDED\", \"stripeRefundId\": \"re_stub_{{request.pathSegments.[1]}}\", \"attempts\": 1, \"message\": \"Refunded\"}",
+    "transformers": ["response-template"]
+  }
+}

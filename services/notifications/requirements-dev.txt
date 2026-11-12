@@ -1,0 +1,6 @@
+-r requirements.txt
+pytest>=8
+pytest-cov>=5
+# same versions as the CI pipeline
+ruff==0.16.1
+pylint==4.0.6

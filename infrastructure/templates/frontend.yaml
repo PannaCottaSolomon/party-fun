@@ -1,0 +1,108 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  party.fun frontend hosting: a private S3 bucket for the built React app, served over HTTPS by Amazon CloudFront
+  (Origin Access Control: only this distribution can read the bucket).
+
+Parameters:
+  Prefix:
+    Type: String
+    Default: partyfun
+    AllowedPattern: '[a-z][a-z0-9-]{1,30}'
+    Description: Name prefix for every resource and export (lowercase).
+
+Resources:
+  Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      # No BucketName: CloudFormation generates a globally unique one.
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+
+  OriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub ${Prefix}-frontend-oac
+        Description: Lets the party.fun CloudFront distribution read the frontend bucket
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub ${Prefix} frontend
+        DefaultRootObject: index.html
+        HttpVersion: http2and3
+        # North America, Europe and Asia (incl. Singapore): cheaper than all edge locations.
+        PriceClass: PriceClass_200
+        Origins:
+          - Id: frontend-bucket
+            DomainName: !GetAtt Bucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt OriginAccessControl.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+        DefaultCacheBehavior:
+          TargetOriginId: frontend-bucket
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+          Compress: true
+          # AWS managed policy "CachingOptimized".
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+        # React Router: paths like /events/e-neon or /admin/refunds aren't files in the bucket (S3 answers 403/404),
+        # so CloudFront serves index.html and the app shows the right page.
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 0
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 0
+
+  BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref Bucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontRead
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub ${Bucket.Arn}/*
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}
+
+Outputs:
+  BucketName:
+    Value: !Ref Bucket
+    Export:
+      Name: !Sub ${Prefix}-frontend-bucket
+  DistributionId:
+    Value: !Ref Distribution
+    Export:
+      Name: !Sub ${Prefix}-frontend-distribution-id
+  SiteUrl:
+    Description: The frontend's public HTTPS URL
+    Value: !Sub https://${Distribution.DomainName}
+    Export:
+      Name: !Sub ${Prefix}-frontend-url

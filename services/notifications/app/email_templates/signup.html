@@ -1,0 +1,12 @@
+{% extends "base.html" %}
+{% block heading %}You're in!{% endblock %}
+{% block body %}
+<p>Your spot at <strong>{{ event_title }}</strong> is confirmed.</p>
+<table role="presentation" cellpadding="0" cellspacing="0" style="margin:16px 0;">
+  <tr><td style="padding:4px 16px 4px 0;color:#7b8794;">When</td><td>{{ event_date | event_date }}</td></tr>
+  <tr><td style="padding:4px 16px 4px 0;color:#7b8794;">Where</td><td>{{ location }}</td></tr>
+  {% if amount is not none %}<tr><td style="padding:4px 16px 4px 0;color:#7b8794;">Paid</td><td>{{ amount | money(currency) }}</td></tr>{% endif %}
+  <tr><td style="padding:4px 16px 4px 0;color:#7b8794;">Booking ref</td><td>{{ registration_id }}</td></tr>
+</table>
+<p>If the event is cancelled, you'll be refunded in full automatically.</p>
+{% endblock %}

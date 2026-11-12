@@ -1,0 +1,17 @@
+{
+  "name": "POST /payments with Stripe's test card pm_card_chargeDeclined: FAILED (a declined card is an answer, not an error)",
+  "priority": 5,
+  "request": {
+    "method": "POST",
+    "url": "/payments",
+    "bodyPatterns": [
+      { "matchesJsonPath": { "expression": "$.paymentMethodId", "equalTo": "pm_card_chargeDeclined" } }
+    ]
+  },
+  "response": {
+    "status": 201,
+    "headers": { "Content-Type": "application/json" },
+    "body": "{\"paymentId\": {{jsonPath request.body '$.bookingId'}}, \"bookingId\": {{jsonPath request.body '$.bookingId'}}, \"currency\": \"SGD\", \"status\": \"FAILED\", \"failureReason\": \"Your card was declined.\"}",
+    "transformers": ["response-template"]
+  }
+}

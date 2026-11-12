@@ -1,0 +1,473 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  party.fun Notification Service: its MySQL database on Amazon RDS (notification log and user directory), and the
+  service on Amazon ECS (Fargate), both in the account's default VPC. It consumes notify.* and user.* messages from
+  RabbitMQ and sends emails through Resend; a CloudWatch alarm fires when an email is dropped after its last retry.
+  ECS pulls the image straight from the notifications project's GitLab container registry. Needs the secrets stack
+  (Resend API key set in partyfun/notifications); the cluster, rabbitmq and observability stacks are optional.
+
+Parameters:
+  Prefix:
+    Type: String
+    Default: partyfun
+    AllowedPattern: '[a-z][a-z0-9-]{1,30}'
+    Description: Name prefix for every resource and export (lowercase).
+  ImageUri:
+    Type: String
+    Description: >-
+      The Notification Service image in the GitLab registry, tagged with the commit it was built from
+      (registry.gitlab.com/cs302-2026/g4-team2/services/notifications/main:<commit sha>), so every deploy of a new
+      build changes the task definition and rolls the service.
+  RegistryUsername:
+    Type: String
+    NoEcho: true
+    Description: Username of a GitLab deploy token with the read_registry scope.
+  RegistryToken:
+    Type: String
+    NoEcho: true
+    Description: The deploy token itself.
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: The default VPC (the tasks and the database run in it).
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Public subnets of that VPC for the tasks (they get a public IP to reach GitLab, CloudWatch and Resend).
+  ExecutionRoleArn:
+    Type: String
+    Default: ''
+    Description: >-
+      An existing role ECS uses to pull the image, write logs and read the secrets (e.g. LabRole in an AWS Academy
+      Learner Lab, which can't create IAM roles). Empty: this stack creates one.
+  RabbitMqHost:
+    Type: String
+    Default: ''
+    Description: >-
+      The RabbitMQ broker's host name (e.g. rabbitmq.partyfun.local). Empty: the consumer is off, and only the HTTP
+      endpoints work.
+  ServicesSecurityGroupId:
+    Type: String
+    Default: ''
+    Description: >-
+      The cluster stack's shared services security group. RabbitMQ and the OpenTelemetry Collector only accept
+      connections from it, so set it together with RabbitMqHost or OtlpEndpoint.
+  NamespaceId:
+    Type: String
+    Default: ''
+    Description: The cluster stack's private DNS namespace. When set, the API is at notifications.<Prefix>.local:5000.
+  OtlpEndpoint:
+    Type: String
+    Default: ''
+    Description: >-
+      The observability stack's OpenTelemetry Collector (output OtlpEndpoint), where the service sends its traces.
+      Empty: tracing is off.
+  EmailFrom:
+    Type: String
+    Default: party.fun <onboarding@resend.dev>
+    Description: >-
+      Sender. Resend's onboarding@resend.dev only delivers to the Resend account's own address; use an address on a
+      domain verified in Resend to email anyone.
+  AdminEmail:
+    Type: String
+    Default: ''
+    Description: >-
+      Receives admin_alert emails (e.g. a refund that failed for good). Empty: those alerts are dropped.
+  EmailRedirectTo:
+    Type: String
+    Default: ''
+    Description: >-
+      Testing: send every email to this address instead, with the real recipient in the subject. Empty: emails go to
+      their recipients.
+  AlarmEmail:
+    Type: String
+    Default: ''
+    Description: Who is emailed when an email is dropped after its last retry (AWS sends a confirmation link first).
+  AdminCidr:
+    Type: String
+    Default: 127.0.0.1/32
+    AllowedPattern: '(\d{1,3}\.){3}\d{1,3}/\d{1,2}'
+    Description: >-
+      Your IP as x.x.x.x/32, allowed to call the HTTP API on port 5000 (GET /notifications needs the API key too).
+      The default allows no one from outside the VPC.
+  DesiredCount:
+    Type: Number
+    Default: 1
+    MinValue: 0
+    Description: Number of running tasks (0 stops the service but keeps the database). 2 also works.
+  DatabaseInstanceClass:
+    Type: String
+    Default: db.t4g.micro
+    Description: RDS instance class of the notifications database.
+
+Conditions:
+  CreateExecutionRole: !Equals [!Ref ExecutionRoleArn, '']
+  HasRabbitMq: !Not [!Equals [!Ref RabbitMqHost, '']]
+  HasServicesSecurityGroup: !Not [!Equals [!Ref ServicesSecurityGroupId, '']]
+  HasNamespace: !Not [!Equals [!Ref NamespaceId, '']]
+  HasOtlp: !Not [!Equals [!Ref OtlpEndpoint, '']]
+  HasAdminEmail: !Not [!Equals [!Ref AdminEmail, '']]
+  HasRedirect: !Not [!Equals [!Ref EmailRedirectTo, '']]
+  HasAlarmEmail: !Not [!Equals [!Ref AlarmEmail, '']]
+
+Resources:
+  # ECS logs in to registry.gitlab.com with this on every image pull (the CI job token expires with the job).
+  RegistrySecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub ${Prefix}/notifications-registry
+      Description: GitLab deploy token (read_registry) ECS uses to pull the Notification Service image.
+      SecretString: !Sub '{"username":"${RegistryUsername}","password":"${RegistryToken}"}'
+
+  # ---- Security groups ----
+
+  # The HTTP API (port 5000) is internal: the other services' group, the admin IP and API Gateway's VPC Link (that
+  # rule is in the api stack) only. The service's real work comes from RabbitMQ, which it connects to itself.
+  ServiceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Notification Service tasks (HTTP API on port 5000)
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - Description: HTTP API from the admin IP
+          IpProtocol: tcp
+          FromPort: 5000
+          ToPort: 5000
+          CidrIp: !Ref AdminCidr
+
+  ApiFromServices:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasServicesSecurityGroup
+    Properties:
+      GroupId: !Ref ServiceSecurityGroup
+      Description: HTTP API from the other backend services
+      IpProtocol: tcp
+      FromPort: 5000
+      ToPort: 5000
+      SourceSecurityGroupId: !Ref ServicesSecurityGroupId
+
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Notifications database (MySQL from the Notification Service tasks only)
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref ServiceSecurityGroup
+
+  # ---- Database: MySQL 8.4 (as in the service's CI), not public, encrypted ----
+
+  # The notification log and the user directory (user id -> email and name). The service creates its tables on
+  # startup. Credentials are the shared application user from the secrets stack (partyfun/database). Deleting the
+  # stack, or a change that replaces the instance, keeps a final snapshot.
+  Database:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: !Sub ${Prefix}-notifications-db
+      Engine: mysql
+      EngineVersion: '8.4'
+      DBInstanceClass: !Ref DatabaseInstanceClass
+      AllocatedStorage: '20'
+      StorageType: gp3
+      StorageEncrypted: true
+      DBName: notifications
+      MasterUsername: !Sub '{{resolve:secretsmanager:${Prefix}/database:SecretString:username}}'
+      MasterUserPassword: !Sub '{{resolve:secretsmanager:${Prefix}/database:SecretString:password}}'
+      VPCSecurityGroups:
+        - !Ref DatabaseSecurityGroup
+      PubliclyAccessible: false
+      MultiAZ: false
+      BackupRetentionPeriod: 1
+      AutoMinorVersionUpgrade: true
+      CopyTagsToSnapshot: true
+
+  # ---- ECS: one Fargate service ----
+
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub ${Prefix}-notifications
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/${Prefix}/notifications
+      RetentionInDays: 30
+
+  # Pulls the image, writes the logs, and reads only the secrets the task needs. The service itself calls no AWS API
+  # (Resend is reached over the internet), so the task has no role of its own.
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Condition: CreateExecutionRole
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: read-secrets
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref RegistrySecret
+                  - Fn::ImportValue: !Sub ${Prefix}-notifications-secret-arn
+                  - Fn::ImportValue: !Sub ${Prefix}-database-secret-arn
+                  - Fn::ImportValue: !Sub ${Prefix}-rabbitmq-secret-arn
+
+  # Keys and passwords are injected by ECS from Secrets Manager at task start; they never appear in the task
+  # definition. The service builds its RabbitMQ and MySQL connections from the parts.
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub ${Prefix}-notifications
+      RequiresCompatibilities:
+        - FARGATE
+      NetworkMode: awsvpc
+      Cpu: '256'
+      Memory: '512'
+      RuntimePlatform:
+        CpuArchitecture: X86_64
+        OperatingSystemFamily: LINUX
+      ExecutionRoleArn: !If [CreateExecutionRole, !GetAtt ExecutionRole.Arn, !Ref ExecutionRoleArn]
+      ContainerDefinitions:
+        - Name: notifications
+          Image: !Ref ImageUri
+          RepositoryCredentials:
+            CredentialsParameter: !Ref RegistrySecret
+          Essential: true
+          PortMappings:
+            - ContainerPort: 5000
+              Protocol: tcp
+          # No load balancer, so ECS judges the task by its health check: /ready (the RabbitMQ consumer is
+          # connected) once a broker is configured, /health (the process is up) until then. The image has no curl.
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - !If
+                - HasRabbitMq
+                - python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/ready', timeout=3)"
+                - python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/health', timeout=3)"
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 30
+          # Longer than SHUTDOWN_TIMEOUT_S (25 s): a deploy lets the email in progress finish.
+          StopTimeout: 30
+          Environment:
+            - Name: APP_NAME
+              Value: party.fun
+            - Name: EMAIL_FROM
+              Value: !Ref EmailFrom
+            - Name: EMAIL_DRY_RUN
+              Value: 'false'
+            - !If
+              - HasAdminEmail
+              - Name: ADMIN_EMAIL
+                Value: !Ref AdminEmail
+              - !Ref AWS::NoValue
+            - !If
+              - HasRedirect
+              - Name: EMAIL_REDIRECT_TO
+                Value: !Ref EmailRedirectTo
+              - !Ref AWS::NoValue
+            - Name: DB_HOST
+              Value: !GetAtt Database.Endpoint.Address
+            - Name: DB_PORT
+              Value: !GetAtt Database.Endpoint.Port
+            - Name: DB_NAME
+              Value: notifications
+            - Name: ENABLE_CONSUMER
+              Value: !If [HasRabbitMq, 'true', 'false']
+            - !If
+              - HasRabbitMq
+              - Name: RABBITMQ_HOST
+                Value: !Ref RabbitMqHost
+              - !Ref AWS::NoValue
+            # Tracing (observability stack): the image is auto-instrumented when OTEL_ENABLED=true.
+            - Name: OTEL_ENABLED
+              Value: !If [HasOtlp, 'true', 'false']
+            - !If
+              - HasOtlp
+              - Name: OTEL_EXPORTER_OTLP_ENDPOINT
+                Value: !Ref OtlpEndpoint
+              - !Ref AWS::NoValue
+            - Name: OTEL_EXPORTER_OTLP_PROTOCOL
+              Value: http/protobuf
+            - Name: OTEL_TRACES_EXPORTER
+              Value: otlp
+            - Name: OTEL_METRICS_EXPORTER
+              Value: none
+            - Name: OTEL_LOGS_EXPORTER
+              Value: none
+            - Name: OTEL_RESOURCE_ATTRIBUTES
+              Value: !Sub
+                - deployment.environment.name=aws,service.version=${Version}
+                - Version: !Select [1, !Split [':', !Ref ImageUri]]
+          Secrets:
+            - Name: RESEND_API_KEY
+              ValueFrom: !Sub
+                - '${Arn}:resend_api_key::'
+                - Arn:
+                    Fn::ImportValue: !Sub ${Prefix}-notifications-secret-arn
+            - Name: API_KEY
+              ValueFrom: !Sub
+                - '${Arn}:api_key::'
+                - Arn:
+                    Fn::ImportValue: !Sub ${Prefix}-notifications-secret-arn
+            - Name: DB_USERNAME
+              ValueFrom: !Sub
+                - '${Arn}:username::'
+                - Arn:
+                    Fn::ImportValue: !Sub ${Prefix}-database-secret-arn
+            - Name: DB_PASSWORD
+              ValueFrom: !Sub
+                - '${Arn}:password::'
+                - Arn:
+                    Fn::ImportValue: !Sub ${Prefix}-database-secret-arn
+            - Name: RABBITMQ_USERNAME
+              ValueFrom: !Sub
+                - '${Arn}:username::'
+                - Arn:
+                    Fn::ImportValue: !Sub ${Prefix}-rabbitmq-secret-arn
+            - Name: RABBITMQ_PASSWORD
+              ValueFrom: !Sub
+                - '${Arn}:password::'
+                - Arn:
+                    Fn::ImportValue: !Sub ${Prefix}-rabbitmq-secret-arn
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: notifications
+
+  # notifications.<Prefix>.local -> the running tasks' private IPs (A), and IP + port (SRV) for API Gateway's private
+  # integration, which looks the tasks up here (only with the cluster stack's namespace).
+  DiscoveryService:
+    Type: AWS::ServiceDiscovery::Service
+    Condition: HasNamespace
+    Properties:
+      Name: notifications
+      NamespaceId: !Ref NamespaceId
+      DnsConfig:
+        DnsRecords:
+          - Type: A
+            TTL: 10
+          - Type: SRV
+            TTL: 10
+      HealthCheckCustomConfig:
+        FailureThreshold: 1
+
+  # Rolling deploy: the new task must become healthy before the old one stops. If it never does, the circuit breaker
+  # rolls back to the previous task definition and the CloudFormation update fails. Two tasks at once are fine: they
+  # share the queue and the database.
+  Service:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: notifications
+      Cluster: !Ref Cluster
+      LaunchType: FARGATE
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: !Ref DesiredCount
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets: !Ref SubnetIds
+          # The shared services group lets the tasks reach RabbitMQ and the OpenTelemetry Collector.
+          SecurityGroups: !If
+            - HasServicesSecurityGroup
+            - [!Ref ServiceSecurityGroup, !Ref ServicesSecurityGroupId]
+            - [!Ref ServiceSecurityGroup]
+      ServiceRegistries: !If
+        - HasNamespace
+        - - RegistryArn: !GetAtt DiscoveryService.Arn
+            ContainerName: notifications
+            ContainerPort: 5000
+        - !Ref AWS::NoValue
+      PropagateTags: SERVICE
+
+  # ---- Alarm: an email was dropped ----
+
+  # The service logs one ERROR line containing "discarding" for every email it gives up on (after its last retry,
+  # or a message that can never be sent). Each such line counts 1.
+  DiscardedFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref LogGroup
+      FilterPattern: '{ $.level = "ERROR" && $.message = "*discarding*" }'
+      MetricTransformations:
+        - MetricNamespace: !Sub ${Prefix}/notifications
+          MetricName: DiscardedEmails
+          MetricValue: '1'
+          DefaultValue: 0
+
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Condition: HasAlarmEmail
+    Properties:
+      TopicName: !Sub ${Prefix}-notifications-alarms
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref AlarmEmail
+
+  DiscardedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${Prefix}-notifications-email-dropped
+      AlarmDescription: >-
+        An email was dropped after its last retry, or a message could never be sent. Search the log group for
+        "discarding", or GET /notifications?type=... for the failed rows.
+      Namespace: !Sub ${Prefix}/notifications
+      MetricName: DiscardedEmails
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmEmail, [!Ref AlarmTopic], !Ref AWS::NoValue]
+
+Outputs:
+  ClusterName:
+    Value: !Ref Cluster
+    Export:
+      Name: !Sub ${Prefix}-notifications-cluster
+  ServiceName:
+    Value: !GetAtt Service.Name
+  DatabaseEndpoint:
+    Description: The notifications database's host name (reachable from the Notification Service tasks only)
+    Value: !GetAtt Database.Endpoint.Address
+  InternalUrl:
+    Condition: HasNamespace
+    Description: The HTTP API inside the VPC (needs the X-API-Key from partyfun/notifications)
+    Value: !Sub http://notifications.${Prefix}.local:5000
+  DiscoveryServiceArn:
+    Condition: HasNamespace
+    Description: The Cloud Map service API Gateway routes to (api stack)
+    Value: !GetAtt DiscoveryService.Arn
+    Export:
+      Name: !Sub ${Prefix}-notifications-discovery-arn
+  ServiceSecurityGroupId:
+    Description: The tasks' security group (the api stack lets its VPC Link in on port 5000)
+    Value: !Ref ServiceSecurityGroup
+  LogGroupName:
+    Value: !Ref LogGroup
+  ImageUri:
+    Description: The image the service runs
+    Value: !Ref ImageUri

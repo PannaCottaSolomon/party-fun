@@ -1,0 +1,30 @@
+meta {
+  name: Validation Error
+  type: http
+  seq: 12
+}
+
+post {
+  url: {{baseUrl}}/notify_signup
+  body: json
+  auth: none
+}
+
+headers {
+  X-API-Key: {{apiKey}}
+}
+
+body:json {
+  {
+    "email": "not-an-email"
+  }
+}
+
+assert {
+  res.status: eq 400
+  res.body.error: eq validation_failed
+}
+
+docs {
+  Missing and invalid fields: expect 400 with a details object listing each problem.
+}

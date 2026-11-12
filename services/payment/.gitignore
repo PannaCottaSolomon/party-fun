@@ -1,0 +1,26 @@
+# Build output
+target/
+
+# IDEs
+.idea/
+.vscode/
+*.iml
+
+# Logs
+*.log
+
+# Local secrets / environment (commit dev.env.example instead)
+.env
+.env.*
+!.env.example
+dev.env
+
+# Integration-test reports copied out of Docker Compose
+ci/reports/
+
+# Coding-agent instructions (kept locally, not part of the service)
+CLAUDE.md
+AGENTS.md
+
+# CI Maven cache
+.m2/

@@ -1,0 +1,684 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  party.fun API entry point: an Amazon API Gateway HTTP API whose built-in JWT authorizer validates Cognito tokens
+  (signature, issuer, app client, expiry) before proxying requests to the backend services. Each path goes straight
+  to its ECS service (auth, events, payment, notifications) through a VPC Link and Cloud Map (no load balancer);
+  needs the cluster stack.
+
+Parameters:
+  Prefix:
+    Type: String
+    Default: partyfun
+    AllowedPattern: '[a-z][a-z0-9-]{1,30}'
+    Description: Name prefix for every resource and export (lowercase).
+  CognitoIssuer:
+    Type: String
+    Description: The user pool's issuer URL (cognito stack output "Issuer").
+  CognitoAppClientId:
+    Type: String
+    Description: The app client ID (cognito stack output "AppClientId"); tokens must be issued to it.
+  AllowedOrigin:
+    Type: String
+    Description: The frontend's URL (frontend stack output "SiteUrl"); the only origin CORS allows.
+  AuthServiceArn:
+    Type: String
+    Default: ''
+    Description: >-
+      The Authentication Service's Cloud Map service (auth stack output DiscoveryServiceArn). Empty: no /auth or
+      /user routes.
+  EventsServiceArn:
+    Type: String
+    Default: ''
+    Description: >-
+      The Event Service's Cloud Map service (events stack output DiscoveryServiceArn). Empty: no /events routes.
+  PaymentServiceArn:
+    Type: String
+    Default: ''
+    Description: >-
+      The Payment Service's Cloud Map service (payment stack output DiscoveryServiceArn). Empty: no /payments,
+      /bookings or /admin routes.
+  NotificationsServiceArn:
+    Type: String
+    Default: ''
+    Description: >-
+      The Notification Service's Cloud Map service (notifications stack output DiscoveryServiceArn). Empty: no
+      /notifications routes. Set together with NotificationsSecurityGroupId.
+  NotificationsSecurityGroupId:
+    Type: String
+    Default: ''
+    Description: >-
+      The Notification Service tasks' security group (notifications stack output ServiceSecurityGroupId). It only
+      accepts port 5000 from listed sources, so the VPC Link is added to it.
+
+Conditions:
+  HasAuth: !Not [!Equals [!Ref AuthServiceArn, '']]
+  HasEvents: !Not [!Equals [!Ref EventsServiceArn, '']]
+  HasPayment: !Not [!Equals [!Ref PaymentServiceArn, '']]
+  HasNotifications: !Not [!Equals [!Ref NotificationsServiceArn, '']]
+  HasBackend: !Or [!Condition HasAuth, !Condition HasEvents, !Condition HasPayment, !Condition HasNotifications]
+
+Resources:
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub ${Prefix}-api
+      ProtocolType: HTTP
+      # API Gateway answers the browser's CORS preflight (OPTIONS) itself, before any authorizer.
+      CorsConfiguration:
+        AllowOrigins:
+          - !Ref AllowedOrigin
+        AllowMethods:
+          - GET
+          - POST
+          - PUT
+          - PATCH
+          - DELETE
+          - OPTIONS
+        AllowHeaders:
+          - authorization
+          - content-type
+          - accept
+          - x-api-key
+        MaxAge: 600
+
+  # Step 4 of the JWT flow: validate the token and extract its claims. No Lambda: API Gateway fetches the user
+  # pool's public keys and checks the signature, "iss", "exp" and that the token was issued to the app client
+  # ("aud" of an ID token, "client_id" of an access token). Invalid or missing token -> 401, backend never called.
+  JwtAuthorizer:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Properties:
+      ApiId: !Ref HttpApi
+      Name: !Sub ${Prefix}-cognito-jwt
+      AuthorizerType: JWT
+      IdentitySource:
+        - $request.header.Authorization
+      JwtConfiguration:
+        Issuer: !Ref CognitoIssuer
+        Audience:
+          - !Ref CognitoAppClientId
+
+  Stage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: $default
+      AutoDeploy: true
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 100
+        ThrottlingRateLimit: 50
+
+  # ---- Step 5: proxy to the services (each only once its Cloud Map service ARN is set) ----
+
+  # The private doorway from API Gateway into the VPC. API Gateway asks Cloud Map for a healthy task's IP and port
+  # (the services' SRV records) on every request, so tasks replaced by a deploy are found at once. The auth, events and
+  # payment security groups already accept port 8080; Notifications' port 5000 is opened to this group below.
+  VpcLinkSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: HasBackend
+    Properties:
+      GroupDescription: !Sub ${Prefix} API Gateway VPC Link
+      VpcId: !ImportValue
+        Fn::Sub: ${Prefix}-vpc-id
+
+  VpcLink:
+    Type: AWS::ApiGatewayV2::VpcLink
+    Condition: HasBackend
+    Properties:
+      Name: !Sub ${Prefix}-services
+      SubnetIds: !Split [',', !ImportValue {'Fn::Sub': '${Prefix}-subnet-ids'}]
+      SecurityGroupIds:
+        - !Ref VpcLinkSecurityGroup
+
+  NotificationsFromVpcLink:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasNotifications
+    # The group parameter defaults to '' (no notifications stack yet), which cfn-lint flags as "not an sg- id"; this
+    # rule only exists when deploy.sh passes the real id.
+    Metadata:
+      cfn-lint:
+        config:
+          ignore_checks:
+            - W1030
+    Properties:
+      GroupId: !Ref NotificationsSecurityGroupId
+      Description: HTTP API from the API Gateway VPC Link
+      IpProtocol: tcp
+      FromPort: 5000
+      ToPort: 5000
+      SourceSecurityGroupId: !Ref VpcLinkSecurityGroup
+
+  # Public integrations remove the identity header, so a caller can't pretend to be someone. Protected ones set
+  # X-User-Id from the verified token (overwriting anything the caller sent). The group can't be mapped the same way,
+  # because HTTP API mappings reject claim names with a colon ("cognito:groups"); the Authorization header is
+  # forwarded unchanged, so the services read "cognito:groups" from the token's payload.
+  AuthPublicIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Condition: HasAuth
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: HTTP_PROXY
+      IntegrationMethod: ANY
+      ConnectionType: VPC_LINK
+      ConnectionId: !Ref VpcLink
+      IntegrationUri: !Ref AuthServiceArn
+      PayloadFormatVersion: '1.0'
+      RequestParameters:
+        overwrite:path: $request.path
+        remove:header.x-user-id: "''"
+
+  AuthProtectedIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Condition: HasAuth
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: HTTP_PROXY
+      IntegrationMethod: ANY
+      ConnectionType: VPC_LINK
+      ConnectionId: !Ref VpcLink
+      IntegrationUri: !Ref AuthServiceArn
+      PayloadFormatVersion: '1.0'
+      RequestParameters:
+        overwrite:path: $request.path
+        overwrite:header.x-user-id: $context.authorizer.jwt.claims.sub
+
+  EventsIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Condition: HasEvents
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: HTTP_PROXY
+      IntegrationMethod: ANY
+      ConnectionType: VPC_LINK
+      ConnectionId: !Ref VpcLink
+      IntegrationUri: !Ref EventsServiceArn
+      PayloadFormatVersion: '1.0'
+      RequestParameters:
+        overwrite:path: $request.path
+        overwrite:header.x-user-id: $context.authorizer.jwt.claims.sub
+
+  PaymentPublicIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Condition: HasPayment
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: HTTP_PROXY
+      IntegrationMethod: ANY
+      ConnectionType: VPC_LINK
+      ConnectionId: !Ref VpcLink
+      IntegrationUri: !Ref PaymentServiceArn
+      PayloadFormatVersion: '1.0'
+      RequestParameters:
+        overwrite:path: $request.path
+        remove:header.x-user-id: "''"
+
+  PaymentProtectedIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Condition: HasPayment
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: HTTP_PROXY
+      IntegrationMethod: ANY
+      ConnectionType: VPC_LINK
+      ConnectionId: !Ref VpcLink
+      IntegrationUri: !Ref PaymentServiceArn
+      PayloadFormatVersion: '1.0'
+      RequestParameters:
+        overwrite:path: $request.path
+        overwrite:header.x-user-id: $context.authorizer.jwt.claims.sub
+
+  NotificationsIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Condition: HasNotifications
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: HTTP_PROXY
+      IntegrationMethod: ANY
+      ConnectionType: VPC_LINK
+      ConnectionId: !Ref VpcLink
+      IntegrationUri: !Ref NotificationsServiceArn
+      PayloadFormatVersion: '1.0'
+      RequestParameters:
+        overwrite:path: $request.path
+        overwrite:header.x-user-id: $context.authorizer.jwt.claims.sub
+
+  # ---- Routes. Paths no route matches get 404. ----
+  # Routes that need a token list their methods instead of ANY: ANY would also match the browser's CORS preflight
+  # (OPTIONS, which never carries a token), the authorizer would answer 401, and the browser would block the call.
+  # With no OPTIONS route, API Gateway answers every preflight itself with the CORS settings above.
+
+  # Authentication Service. Signing up, confirming and the sign-up settings (GET /auth/config) come before the user
+  # has a token; the profile (/user/me) needs one.
+  AuthRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: HasAuth
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: ANY /auth/{proxy+}
+      Target: !Sub integrations/${AuthPublicIntegration}
+
+  UserGetRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: HasAuth
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: GET /user/{proxy+}
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub integrations/${AuthProtectedIntegration}
+
+  UserPostRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: HasAuth
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: POST /user/{proxy+}
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub integrations/${AuthProtectedIntegration}
+
+  UserPutRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: HasAuth
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: PUT /user/{proxy+}
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub integrations/${AuthProtectedIntegration}
+
+  UserPatchRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: HasAuth
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: PATCH /user/{proxy+}
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub integrations/${AuthProtectedIntegration}
+
+  UserDeleteRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: HasAuth
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: DELETE /user/{proxy+}
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub integrations/${AuthProtectedIntegration}
+
+  # Event Service: every call needs a token (the service also checks the role from cognito:groups).
+  EventsGetRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: HasEvents
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: GET /events
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub integrations/${EventsIntegration}
+
+  EventsPostRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: HasEvents
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: POST /events
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub integrations/${EventsIntegration}
+
+  EventsPutRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: HasEvents
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: PUT /events
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub integrations/${EventsIntegration}
+
+  EventsPatchRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: HasEvents
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: PATCH /events
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub integrations/${EventsIntegration}
+
+  EventsDeleteRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: HasEvents
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: DELETE /events
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub integrations/${EventsIntegration}
+
+  EventsProxyGetRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: HasEvents
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: GET /events/{proxy+}
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub integrations/${EventsIntegration}
+
+  EventsProxyPostRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: HasEvents
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: POST /events/{proxy+}
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub integrations/${EventsIntegration}
+
+  EventsProxyPutRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: HasEvents
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: PUT /events/{proxy+}
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub integrations/${EventsIntegration}
+
+  EventsProxyPatchRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: HasEvents
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: PATCH /events/{proxy+}
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub integrations/${EventsIntegration}
+
+  EventsProxyDeleteRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: HasEvents
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: DELETE /events/{proxy+}
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub integrations/${EventsIntegration}
+
+  # Payment Service. Public: the Stripe publishable key, a payment's status (the checkout page polls it), and Stripe's
+  # webhook (the service verifies Stripe's signature itself). Everything else, /admin/* included, needs a token.
+  PaymentConfigRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: HasPayment
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: GET /payments/config
+      Target: !Sub integrations/${PaymentPublicIntegration}
+
+  PaymentStatusRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: HasPayment
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: GET /payments/{paymentId}
+      Target: !Sub integrations/${PaymentPublicIntegration}
+
+  StripeWebhookRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: HasPayment
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: POST /payments/webhook/stripe
+      Target: !Sub integrations/${PaymentPublicIntegration}
+
+  PaymentsGetRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: HasPayment
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: GET /payments
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub integrations/${PaymentProtectedIntegration}
+
+  PaymentsPostRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: HasPayment
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: POST /payments
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub integrations/${PaymentProtectedIntegration}
+
+  PaymentsPutRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: HasPayment
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: PUT /payments
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub integrations/${PaymentProtectedIntegration}
+
+  PaymentsPatchRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: HasPayment
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: PATCH /payments
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub integrations/${PaymentProtectedIntegration}
+
+  PaymentsDeleteRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: HasPayment
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: DELETE /payments
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub integrations/${PaymentProtectedIntegration}
+
+  # No GET /payments/{proxy+}: it would clash with the public GET /payments/{paymentId} (API Gateway allows only one
+  # path variable per level and method), so Payment's other GET paths are listed one by one.
+  PaymentsBookingGetRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: HasPayment
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: GET /payments/booking/{bookingId}
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub integrations/${PaymentProtectedIntegration}
+
+  PaymentsUserGetRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: HasPayment
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: GET /payments/user/{userId}
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub integrations/${PaymentProtectedIntegration}
+
+  PaymentsProxyPostRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: HasPayment
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: POST /payments/{proxy+}
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub integrations/${PaymentProtectedIntegration}
+
+  PaymentsProxyPutRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: HasPayment
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: PUT /payments/{proxy+}
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub integrations/${PaymentProtectedIntegration}
+
+  PaymentsProxyPatchRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: HasPayment
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: PATCH /payments/{proxy+}
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub integrations/${PaymentProtectedIntegration}
+
+  PaymentsProxyDeleteRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: HasPayment
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: DELETE /payments/{proxy+}
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub integrations/${PaymentProtectedIntegration}
+
+  BookingsGetRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: HasPayment
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: GET /bookings/{proxy+}
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub integrations/${PaymentProtectedIntegration}
+
+  BookingsPostRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: HasPayment
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: POST /bookings/{proxy+}
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub integrations/${PaymentProtectedIntegration}
+
+  BookingsPutRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: HasPayment
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: PUT /bookings/{proxy+}
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub integrations/${PaymentProtectedIntegration}
+
+  BookingsPatchRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: HasPayment
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: PATCH /bookings/{proxy+}
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub integrations/${PaymentProtectedIntegration}
+
+  BookingsDeleteRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: HasPayment
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: DELETE /bookings/{proxy+}
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub integrations/${PaymentProtectedIntegration}
+
+  AdminGetRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: HasPayment
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: GET /admin/{proxy+}
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub integrations/${PaymentProtectedIntegration}
+
+  AdminPostRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: HasPayment
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: POST /admin/{proxy+}
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub integrations/${PaymentProtectedIntegration}
+
+  AdminPutRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: HasPayment
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: PUT /admin/{proxy+}
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub integrations/${PaymentProtectedIntegration}
+
+  AdminPatchRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: HasPayment
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: PATCH /admin/{proxy+}
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub integrations/${PaymentProtectedIntegration}
+
+  AdminDeleteRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: HasPayment
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: DELETE /admin/{proxy+}
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub integrations/${PaymentProtectedIntegration}
+
+  # Notification Service: read-only, for admins and tools. The email log (/notifications) also needs the service's
+  # X-API-Key, which the caller sends (it is in no route or bundle, so a logged-in participant can't read the log).
+  # POST /notify_* (sends emails) is for the other services only and has no route.
+  NotificationsGetRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: HasNotifications
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: GET /notifications
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub integrations/${NotificationsIntegration}
+
+  NotificationTypesGetRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: HasNotifications
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: GET /notification-types
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub integrations/${NotificationsIntegration}
+
+Outputs:
+  ApiUrl:
+    Description: The API's base URL (the frontend's VITE_PAYMENT_API_URL)
+    Value: !Sub https://${HttpApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}
+    Export:
+      Name: !Sub ${Prefix}-api-url
+  ApiId:
+    Value: !Ref HttpApi
+    Export:
+      Name: !Sub ${Prefix}-api-id
+  JwtAuthorizerId:
+    Value: !Ref JwtAuthorizer
+    Export:
+      Name: !Sub ${Prefix}-jwt-authorizer-id

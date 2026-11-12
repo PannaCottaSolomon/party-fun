@@ -1,0 +1,100 @@
+# nginx config template. The nginx image fills in ${...} from the container's environment at start
+# (envsubst), writing /etc/nginx/conf.d/default.conf. nginx's own variables ($uri, $1 ...) are left alone.
+#
+#   PAYMENT_UPSTREAM          where the Payment Service is, from inside this container (default http://payment:8080)
+#   EVENTS_UPSTREAM           where the Event Service is, from inside this container (default http://events:8080)
+#   AUTH_UPSTREAM             where the Authentication Service is (default http://authentication:8080)
+#   payment_admin_api_key     the Payment Service's admin key        } from .env, via compose.yaml;
+#   payment_service_api_key   the Payment Service's internal key     } never sent to the browser
+
+server {
+    listen 80;
+    server_name _;
+    root /usr/share/nginx/html;
+
+    # Docker's DNS: the Payment Service's name is looked up per request, so nginx starts even if it isn't up yet.
+    resolver 127.0.0.11 valid=10s ipv6=off;
+
+    # Client-side routing: unknown paths (e.g. /bookings/12) serve index.html and React Router takes over.
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+
+    # index.html names the current build's /assets files, so the browser must re-check it on every load;
+    # otherwise it keeps running an old build after a rebuild.
+    location = /index.html {
+        add_header Cache-Control "no-cache";
+    }
+
+    # Vite puts content-hashed files in /assets, so they can be cached forever.
+    location /assets/ {
+        expires 1y;
+        add_header Cache-Control "public, immutable";
+    }
+
+    # ---- Calls the browser can't make itself, because they need a key it must never hold. Exactly these are
+    # forwarded to the Payment Service, with the key added here; any key header sent by the browser is replaced.
+
+    # Admin dashboard: the refund dead-letter queue (count, failed refunds) ... The app calls the API Gateway's
+    # /admin/... (here /gw/admin/...); in AWS the gateway sends it on with the Admin's Cognito token, which the Payment
+    # Service checks. Locally the Payment Service usually has no user pool configured, so the key is added here.
+    location ~ ^/gw/admin/refunds/(failed|dlq/count)$ {
+        limit_except GET { deny all; }
+        set $payment_target ${PAYMENT_UPSTREAM}/admin/refunds/$1;
+        proxy_pass $payment_target;
+        proxy_set_header X-Admin-Api-Key "${payment_admin_api_key}";
+        proxy_set_header X-Service-Api-Key "";
+        proxy_set_header Authorization "";
+    }
+
+    # ... and retrying one failed refund.
+    location ~ ^/gw/admin/refunds/([0-9]+)/retry$ {
+        limit_except POST { deny all; }
+        set $payment_target ${PAYMENT_UPSTREAM}/admin/refunds/$1/retry;
+        proxy_pass $payment_target;
+        proxy_set_header X-Admin-Api-Key "${payment_admin_api_key}";
+        proxy_set_header X-Service-Api-Key "";
+        proxy_set_header Authorization "";
+    }
+
+    # Refunds when an organiser cancels an event, with the internal service key (the Event Service's role).
+    location ~ ^/api/payment-internal/payments/([0-9]+)/refund$ {
+        limit_except POST { deny all; }
+        set $payment_target ${PAYMENT_UPSTREAM}/payments/$1/refund;
+        proxy_pass $payment_target;
+        proxy_set_header X-Service-Api-Key "${payment_service_api_key}";
+        proxy_set_header X-Admin-Api-Key "";
+        proxy_set_header Authorization "";
+    }
+
+    # ---- The Authentication (User) Service, behind /gw as well, like the API Gateway in AWS (/user/* and /auth/* go
+    # to it): profile + role setup after sign-up (/gw/user/me), the email-verification switch (/gw/auth/config),
+    # confirming a sign-up without the code. /gw/user/me → ${AUTH_UPSTREAM}/user/me, Authorization passed through.
+    # These are more specific than /gw/ below, so nginx picks them first.
+    location /gw/user {
+        set $auth_target ${AUTH_UPSTREAM};
+        rewrite ^/gw/(.*)$ /$1 break;
+        proxy_pass $auth_target;
+    }
+
+    location /gw/auth/ {
+        set $auth_target ${AUTH_UPSTREAM};
+        rewrite ^/gw/(.*)$ /$1 break;
+        proxy_pass $auth_target;
+    }
+
+    # ---- The Event Service, same origin as the app (VITE_API_BASE_URL=/gw), because it has no CORS settings; in AWS
+    # the API Gateway plays this role. /gw/events?x=1 → ${EVENTS_UPSTREAM}/events?x=1, with the browser's
+    # Authorization header (the Cognito access token) passed through.
+    location /gw/ {
+        # set before rewrite: "rewrite ... break" stops processing the lines after it.
+        set $events_target ${EVENTS_UPSTREAM};
+        rewrite ^/gw/(.*)$ /$1 break;
+        proxy_pass $events_target;
+    }
+
+    # Anything else under /api is not forwarded.
+    location /api/ {
+        return 404;
+    }
+}

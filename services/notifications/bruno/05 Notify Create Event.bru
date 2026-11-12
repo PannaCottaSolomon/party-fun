@@ -1,0 +1,36 @@
+meta {
+  name: Notify Create Event
+  type: http
+  seq: 5
+}
+
+post {
+  url: {{baseUrl}}/notify_create_event
+  body: json
+  auth: none
+}
+
+headers {
+  X-API-Key: {{apiKey}}
+}
+
+body:json {
+  {
+    "notification_id": "event_created-{{runId}}",
+    "email": "organiser@example.com",
+    "name": "Priya",
+    "event_title": "Off-campus Beach Day",
+    "event_date": "2026-12-05T10:00:00+08:00",
+    "location": "Sentosa, Siloso Beach",
+    "event_id": 77
+  }
+}
+
+script:pre-request {
+  bru.setVar("runId", Date.now());
+}
+
+assert {
+  res.status: eq 200
+  res.body.status: eq sent
+}

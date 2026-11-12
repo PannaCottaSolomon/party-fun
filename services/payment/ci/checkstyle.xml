@@ -1,0 +1,68 @@
+<?xml version="1.0"?>
+<!DOCTYPE module PUBLIC
+        "-//Checkstyle//DTD Checkstyle Configuration 1.3//EN"
+        "https://checkstyle.org/dtds/configuration_1_3.dtd">
+
+<!--
+  Pragmatic Checkstyle rules for the Payment Service: catches real problems (unused imports,
+  missing braces, equals without hashCode, naming...) without fighting the code style.
+  Any violation fails `mvn checkstyle:check` and the CI job.
+-->
+<module name="Checker">
+    <property name="charset" value="UTF-8"/>
+    <property name="severity" value="error"/>
+    <property name="fileExtensions" value="java"/>
+
+    <module name="FileTabCharacter"/>
+    <module name="NewlineAtEndOfFile">
+        <property name="lineSeparator" value="lf_cr_crlf"/>
+    </module>
+    <module name="LineLength">
+        <property name="max" value="130"/>
+        <property name="ignorePattern" value="^(package|import) "/>
+    </module>
+
+    <module name="TreeWalker">
+        <!-- imports -->
+        <module name="AvoidStarImport"/>
+        <module name="RedundantImport"/>
+        <module name="UnusedImports"/>
+        <module name="IllegalImport"/>
+
+        <!-- naming (single-segment base package "payment" is allowed) -->
+        <module name="PackageName">
+            <property name="format" value="^[a-z]+(\.[a-z][a-z0-9]*)*$"/>
+        </module>
+        <module name="TypeName"/>
+        <module name="MethodName"/>
+        <module name="MemberName"/>
+        <module name="ParameterName"/>
+        <module name="LocalVariableName"/>
+        <module name="ConstantName">
+            <property name="format" value="^(log|[A-Z][A-Z0-9]*(_[A-Z0-9]+)*)$"/>
+        </module>
+
+        <!-- blocks and statements -->
+        <module name="NeedBraces"/>
+        <module name="LeftCurly"/>
+        <module name="RightCurly"/>
+        <module name="EmptyBlock">
+            <property name="option" value="text"/>
+        </module>
+        <module name="EmptyStatement"/>
+        <module name="OneStatementPerLine"/>
+        <module name="MultipleVariableDeclarations"/>
+
+        <!-- likely bugs -->
+        <module name="EqualsHashCode"/>
+        <module name="StringLiteralEquality"/>
+        <module name="SimplifyBooleanExpression"/>
+        <module name="SimplifyBooleanReturn"/>
+        <module name="FallThrough"/>
+        <module name="MissingSwitchDefault"/>
+        <module name="UpperEll"/>
+        <module name="ModifierOrder"/>
+        <module name="RedundantModifier"/>
+        <module name="ArrayTypeStyle"/>
+    </module>
+</module>

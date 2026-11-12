@@ -1,0 +1,20 @@
+spring:
+  datasource:
+    url: jdbc:h2:mem:authdb;MODE=PostgreSQL
+    driver-class-name: org.h2.Driver
+    username: sa
+    password:
+  jpa:
+    hibernate:
+      ddl-auto: create-drop
+  rabbitmq:
+    host: localhost
+    port: 5672
+
+# Cognito itself is never called in tests: CognitoGateway is mocked and tokens are signed with a test key
+# (see auth.security.TestTokens).
+auth:
+  cognito:
+    region: ap-southeast-1
+    user-pool-id: ap-southeast-1_testpool
+    client-id: test-client

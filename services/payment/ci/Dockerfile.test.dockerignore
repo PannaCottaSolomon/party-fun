@@ -1,0 +1,5 @@
+# Build context rules for ci/Dockerfile.test only (overrides the root .dockerignore).
+# The test runner needs nothing but the Maven project.
+*
+!pom.xml
+!src/

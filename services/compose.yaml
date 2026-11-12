@@ -1,0 +1,28 @@
+volumes:
+  rabbitmq_data:
+
+services:
+  ####################################
+  # RabbitMQ: The messaging broker   
+  ####################################
+  rabbitmq:
+    image: rabbitmq:4.3-management
+    hostname: rabbitmq
+    restart: always
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes: 
+      - rabbitmq_data:/var/lib/rabbitmq
+  ####################################
+  # Atomic Microservice: Events
+  ####################################
+  events:
+    build:
+      context: ./services/events
+      dockerfile: Dockerfile
+    restart: always
+    env_file:
+      - 'dev.env'
+    ports:
+      - "30000:8080"

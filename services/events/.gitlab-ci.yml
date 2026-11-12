@@ -1,0 +1,245 @@
+####################################################################################################################
+# CI/CD pipeline for the Events Service (Java 21 / Spring Boot 4).
+#
+#   lint     hadolint (Dockerfile)
+#   test     unit tests | integration tests (Testcontainers on Docker-in-Docker) + coverage gate |
+#            chaos tests (the payment service and the broker failing mid-saga: no money may be left behind) |
+#            GitLab SAST | GitLab secret detection
+#   package  build the image, boot it against real PostgreSQL + RabbitMQ (smoke test), push it as :<commit sha>
+#   scan     Trivy: vulnerability report, CycloneDX SBOM, and a gate on fixable CRITICAL vulnerabilities
+#   release  promote the tested and scanned image: :latest on the default branch, :<tag> on a git tag
+#
+# Build once, promote: the exact image that passed the smoke test and the scan is the one that gets released.
+# No deploy stage: releasing means publishing the image to this project's container registry (team convention);
+# the deployment target pulls it and receives DB_PASSWORD / RABBITMQ_PASSWORD from its own secret store.
+#
+# No secrets are needed: tests start their own database and broker (plus Toxiproxy in front of the broker), stand in
+# for the payment service with WireMock, and registry access uses GitLab's built-in $CI_REGISTRY* job credentials.
+# Runners must allow privileged Docker-in-Docker (GitLab.com shared runners do).
+####################################################################################################################
+
+include:
+  - template: Jobs/SAST.gitlab-ci.yml
+  - template: Jobs/Secret-Detection.gitlab-ci.yml
+
+stages:
+  - lint
+  - test
+  - package
+  - scan
+  - release
+
+# One pipeline per branch push and per tag (merge requests show the branch pipeline)
+workflow:
+  rules:
+    - if: $CI_COMMIT_TAG
+    - if: $CI_COMMIT_BRANCH
+
+variables:
+  # Pinned tool images: the same Maven as the wrapper (.mvn/wrapper), the same Docker for every Docker job
+  MAVEN_IMAGE: maven:3.10.0-eclipse-temurin-21
+  DOCKER_IMAGE: docker:29.9.1
+  DIND_IMAGE: docker:29.9.1-dind
+  TRIVY_IMAGE: aquasec/trivy:0.76.0
+  HADOLINT_IMAGE: hadolint/hadolint:v2.14.0-debian
+  # Keep downloaded dependencies inside the project directory so GitLab can cache them
+  MAVEN_OPTS: -Dmaven.repo.local=$CI_PROJECT_DIR/.m2/repository
+  MAVEN_CLI_OPTS: --batch-mode --no-transfer-progress --errors
+  # The image this pipeline builds; every later job uses exactly this one
+  IMAGE: $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
+
+default:
+  interruptible: true  # a newer push to the same branch cancels this pipeline
+  retry:
+    max: 1
+    when: [runner_system_failure, stuck_or_timeout_failure, scheduler_failure]
+
+# ---------- reusable templates ----------
+
+.maven:
+  image: $MAVEN_IMAGE
+  cache:
+    key:
+      files: [pom.xml]
+    paths: [.m2/repository]
+
+# Docker-in-Docker without TLS: the daemon is only reachable inside this job's private network
+.dind:
+  services:
+    - name: $DIND_IMAGE
+      alias: docker
+      command: ["--tls=false"]
+      variables:
+        HEALTHCHECK_TCP_PORT: "2375"  # the runner waits for this port before the script starts
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+
+# Maven tests that start Testcontainers (PostgreSQL, RabbitMQ, Toxiproxy) on the Docker-in-Docker service
+.testcontainers:
+  extends: [.maven, .dind]
+  variables:
+    # Containers started by Testcontainers run on the dind host, not on localhost
+    TESTCONTAINERS_HOST_OVERRIDE: docker
+    # The dind daemon is thrown away with the job, so the Ryuk cleanup container is not needed
+    TESTCONTAINERS_RYUK_DISABLED: "true"
+
+.registry-login:
+  before_script:
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+
+####################################################################################################################
+# lint
+####################################################################################################################
+
+hadolint:
+  stage: lint
+  image: $HADOLINT_IMAGE
+  needs: []
+  script:
+    - hadolint Dockerfile
+
+####################################################################################################################
+# test
+####################################################################################################################
+
+# Fast feedback: unit tests only, no Docker
+unit-tests:
+  extends: .maven
+  stage: test
+  needs: []
+  script:
+    - mvn $MAVEN_CLI_OPTS test
+  artifacts:
+    when: always
+    reports:
+      junit: target/surefire-reports/TEST-*.xml
+    expire_in: 1 week
+
+# The authoritative gate: unit + integration tests against real PostgreSQL and RabbitMQ (Testcontainers on the
+# Docker-in-Docker service) and WireMock for the payment service, coverage report, and the coverage gate
+# (line >= 85%, branch >= 75%; see pom.xml). The chaos tests are left out here and run in chaos-tests.
+integration-tests:
+  extends: .testcontainers
+  stage: test
+  needs: []
+  script:
+    - mvn $MAVEN_CLI_OPTS verify
+    # Print the line coverage (columns 8/9 of jacoco.csv are LINE_MISSED/LINE_COVERED) for the coverage regex below
+    - |
+      awk -F, 'NR > 1 { missed += $8; covered += $9 } END { printf "Line coverage: %.1f%%\n", 100 * covered / (missed + covered) }' target/site/jacoco/jacoco.csv
+  coverage: '/Line coverage: \d+\.\d+%/'
+  artifacts:
+    when: always
+    reports:
+      junit: target/failsafe-reports/TEST-*.xml
+      coverage_report:
+        coverage_format: jacoco
+        path: target/site/jacoco/jacoco.xml
+    paths:
+      - target/site/jacoco/
+    expire_in: 1 week
+
+# Chaos experiments (*ChaosIT, JUnit tag "chaos"; mvnw verify -Pchaos): the same stack as the integration tests, with
+# faults injected while a payment or a cancellation is in flight. WireMock makes the payment service time out, drop
+# connections, answer garbage or errors, refuse the service key, or disappear; Toxiproxy cuts the broker. Each
+# experiment asserts that no money is left behind: every charge ends as a confirmed booking or a refund the payment
+# service has taken over, and every event.cancelled reaches the broker once it is back. A failure here blocks the
+# image like a failing integration test.
+chaos-tests:
+  extends: .testcontainers
+  stage: test
+  needs: []
+  script:
+    - mvn $MAVEN_CLI_OPTS verify -Pchaos
+  artifacts:
+    when: always
+    reports:
+      junit: target/failsafe-reports/TEST-*.xml
+    expire_in: 1 week
+
+# GitLab SAST (semgrep-sast) and secret detection (secret_detection) jobs come from the templates included above
+# and run in the test stage. Their findings appear in the pipeline's security tab / job artifacts.
+
+####################################################################################################################
+# package
+####################################################################################################################
+
+# Build the image once, prove it boots and reaches PostgreSQL and RabbitMQ, then push it as :<commit sha>
+build-image:
+  extends: [.dind, .registry-login]
+  stage: package
+  image: $DOCKER_IMAGE
+  needs: [hadolint, unit-tests, integration-tests, chaos-tests]
+  script:
+    # Reuse layers from the last released image (unchanged dependency layers are not rebuilt)
+    - docker pull "$CI_REGISTRY_IMAGE:latest" || true
+    - >
+      docker build --pull
+      --cache-from "$CI_REGISTRY_IMAGE:latest"
+      --build-arg BUILDKIT_INLINE_CACHE=1
+      --label "org.opencontainers.image.source=$CI_PROJECT_URL"
+      --label "org.opencontainers.image.revision=$CI_COMMIT_SHA"
+      --label "org.opencontainers.image.created=$CI_PIPELINE_CREATED_AT"
+      --tag "$IMAGE"
+      .
+    - sh ci/smoke-test.sh "$IMAGE"
+    - docker push "$IMAGE"
+
+####################################################################################################################
+# scan
+####################################################################################################################
+
+# Report HIGH and CRITICAL vulnerabilities and produce an SBOM, then fail on CRITICAL ones that have a fix
+# (fix: bump the base image in the Dockerfile or the vulnerable dependency in pom.xml)
+container-scan:
+  stage: scan
+  image:
+    name: $TRIVY_IMAGE
+    entrypoint: [""]
+  needs: [build-image]
+  variables:
+    TRIVY_USERNAME: $CI_REGISTRY_USER
+    TRIVY_PASSWORD: $CI_REGISTRY_PASSWORD
+    TRIVY_AUTH_URL: $CI_REGISTRY
+    TRIVY_NO_PROGRESS: "true"
+    TRIVY_CACHE_DIR: .trivycache/
+  cache:
+    key: trivy-db
+    paths: [.trivycache/]
+  script:
+    - trivy image --exit-code 0 --severity HIGH,CRITICAL --output trivy-report.txt "$IMAGE"
+    - trivy image --exit-code 0 --format cyclonedx --output sbom.cdx.json "$IMAGE"
+    - cat trivy-report.txt
+    - trivy image --exit-code 1 --severity CRITICAL --ignore-unfixed "$IMAGE"
+  artifacts:
+    when: always
+    paths: [trivy-report.txt, sbom.cdx.json]
+    reports:
+      cyclonedx: sbom.cdx.json
+    expire_in: 30 days
+
+####################################################################################################################
+# release
+####################################################################################################################
+
+# Promote the tested, smoke-tested and scanned image without rebuilding it
+release-image:
+  extends: [.dind, .registry-login]
+  stage: release
+  image: $DOCKER_IMAGE
+  needs: [build-image, container-scan]
+  interruptible: false     # never cancel a release half-way
+  resource_group: release  # one release at a time
+  rules:
+    - if: $CI_COMMIT_TAG
+      variables:
+        RELEASE_TAG: $CI_COMMIT_TAG
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      variables:
+        RELEASE_TAG: latest
+  script:
+    - docker pull "$IMAGE"
+    - docker tag "$IMAGE" "$CI_REGISTRY_IMAGE:$RELEASE_TAG"
+    - docker push "$CI_REGISTRY_IMAGE:$RELEASE_TAG"
+    - echo "Released $CI_REGISTRY_IMAGE:$RELEASE_TAG (from $IMAGE)"

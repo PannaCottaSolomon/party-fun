@@ -1,0 +1,77 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  party.fun container platform shared by every backend service: an ECS (Fargate) cluster, a private DNS namespace so
+  services reach each other by name (e.g. rabbitmq.partyfun.local), and the security group all services join.
+  Runs in an existing VPC (the account's default VPC unless VPC_ID / SUBNET_IDS are set in config.env).
+
+Parameters:
+  Prefix:
+    Type: String
+    Default: partyfun
+    AllowedPattern: '[a-z][a-z0-9-]{1,30}'
+    Description: Name prefix for every resource and export (lowercase).
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC the services run in.
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: >-
+      At least two subnets in different Availability Zones. Tasks pull images from the internet, so these are public
+      subnets (tasks get a public IP; security groups still block every inbound connection not listed) or private
+      subnets with a NAT gateway.
+
+Resources:
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Ref Prefix
+      CapacityProviders: [FARGATE]
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: FARGATE
+          Weight: 1
+
+  # <service>.<Prefix>.local resolves to that service's running tasks, inside the VPC only.
+  Namespace:
+    Type: AWS::ServiceDiscovery::PrivateDnsNamespace
+    Properties:
+      Name: !Sub ${Prefix}.local
+      Vpc: !Ref VpcId
+      Description: party.fun service discovery
+
+  # Every backend service's tasks join this group. Other stacks allow traffic *from* it (e.g. RabbitMQ accepts 5672
+  # only from this group), so only our own services can connect to the broker and the databases.
+  ServicesSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub ${Prefix} backend services
+      VpcId: !Ref VpcId
+      Tags:
+        - Key: Name
+          Value: !Sub ${Prefix}-services
+
+Outputs:
+  ClusterName:
+    Value: !Ref Cluster
+    Export:
+      Name: !Sub ${Prefix}-cluster-name
+  VpcId:
+    Value: !Ref VpcId
+    Export:
+      Name: !Sub ${Prefix}-vpc-id
+  SubnetIds:
+    Description: Comma-separated; other stacks use !Split to read them
+    Value: !Join [',', !Ref SubnetIds]
+    Export:
+      Name: !Sub ${Prefix}-subnet-ids
+  NamespaceId:
+    Value: !GetAtt Namespace.Id
+    Export:
+      Name: !Sub ${Prefix}-namespace-id
+  NamespaceName:
+    Value: !Sub ${Prefix}.local
+    Export:
+      Name: !Sub ${Prefix}-namespace-name
+  ServicesSecurityGroupId:
+    Value: !Ref ServicesSecurityGroup
+    Export:
+      Name: !Sub ${Prefix}-services-sg-id

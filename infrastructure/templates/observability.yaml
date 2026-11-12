@@ -1,0 +1,244 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  party.fun tracing: an OpenTelemetry Collector and Jaeger, as one ECS Fargate task. The backend services send traces
+  (OTLP) to otel-collector.<Prefix>.local:4318; the Collector batches them, removes sensitive attributes and forwards
+  them to Jaeger, which keeps the latest traces in memory and serves the UI on port 16686 to the admin IP only.
+  Swapping Jaeger for another backend is a change to the Collector's config here, not to any service.
+
+Parameters:
+  Prefix:
+    Type: String
+    Default: partyfun
+    AllowedPattern: '[a-z][a-z0-9-]{1,30}'
+    Description: Name prefix for every resource and export (lowercase).
+  CollectorImage:
+    Type: String
+    Default: otel/opentelemetry-collector-contrib:0.119.0
+    Description: Pin a version; the config below uses the otlp receiver, attributes/batch/memory_limiter processors.
+  JaegerImage:
+    Type: String
+    Default: jaegertracing/jaeger:2.3.0
+    Description: Jaeger v2 (built on the OpenTelemetry Collector). Pin a version.
+  MaxTraces:
+    Type: Number
+    Default: 50000
+    Description: Traces Jaeger keeps in memory; the oldest are dropped first. All are lost when the task restarts.
+  AdminCidr:
+    Type: String
+    Default: 127.0.0.1/32
+    AllowedPattern: '(\d{1,3}\.){3}\d{1,3}/\d{1,2}'
+    Description: Who may open the Jaeger UI (port 16686), as x.x.x.x/32. The default allows no one.
+  AssignPublicIp:
+    Type: String
+    Default: ENABLED
+    AllowedValues: [ENABLED, DISABLED]
+    Description: ENABLED in public subnets (to pull images, and to reach the UI); DISABLED in private subnets with a NAT.
+
+Resources:
+  # ------------------------------------------------------------------------------------------------- network
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub ${Prefix} OpenTelemetry Collector and Jaeger
+      VpcId: !ImportValue
+        Fn::Sub: ${Prefix}-vpc-id
+      SecurityGroupIngress:
+        - Description: OTLP over HTTP from the backend services
+          IpProtocol: tcp
+          FromPort: 4318
+          ToPort: 4318
+          SourceSecurityGroupId: !ImportValue
+            Fn::Sub: ${Prefix}-services-sg-id
+        - Description: OTLP over gRPC from the backend services
+          IpProtocol: tcp
+          FromPort: 4317
+          ToPort: 4317
+          SourceSecurityGroupId: !ImportValue
+            Fn::Sub: ${Prefix}-services-sg-id
+        - Description: Jaeger UI from the admin IP
+          IpProtocol: tcp
+          FromPort: 16686
+          ToPort: 16686
+          CidrIp: !Ref AdminCidr
+      Tags:
+        - Key: Name
+          Value: !Sub ${Prefix}-observability
+
+  # ------------------------------------------------------------------------------------------------- roles
+  # Used by ECS to start the task (pull images, write logs). The containers themselves call no AWS APIs.
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/${Prefix}/observability
+      RetentionInDays: 14
+
+  # -------------------------------------------------------------------------------------------------- task
+  # One task, two containers: they share the task's network, so the Collector reaches Jaeger at localhost.
+  # Jaeger takes OTLP on 14317 (not the usual 4317) because the Collector already uses 4317 and 4318.
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub ${Prefix}-observability
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: '512'
+      Memory: '1024'
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: jaeger
+          Image: !Ref JaegerImage
+          Essential: true
+          Command: [--config=env:JAEGER_CONFIG]
+          PortMappings:
+            - { ContainerPort: 16686, Protocol: tcp }   # UI and query API
+          Environment:
+            - Name: JAEGER_CONFIG
+              Value: !Sub |
+                service:
+                  extensions: [jaeger_storage, jaeger_query]
+                  pipelines:
+                    traces:
+                      receivers: [otlp]
+                      processors: [batch]
+                      exporters: [jaeger_storage_exporter]
+                extensions:
+                  jaeger_query:
+                    storage:
+                      traces: memstore
+                    http:
+                      endpoint: 0.0.0.0:16686
+                  jaeger_storage:
+                    backends:
+                      memstore:
+                        memory:
+                          max_traces: ${MaxTraces}
+                receivers:
+                  otlp:
+                    protocols:
+                      grpc:
+                        endpoint: 0.0.0.0:14317
+                processors:
+                  batch: {}
+                exporters:
+                  jaeger_storage_exporter:
+                    trace_storage: memstore
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: jaeger
+
+        - Name: otel-collector
+          Image: !Ref CollectorImage
+          Essential: true
+          DependsOn:
+            - { ContainerName: jaeger, Condition: START }
+          Command: [--config=env:OTELCOL_CONFIG]
+          PortMappings:
+            - { ContainerPort: 4317, Protocol: tcp }    # OTLP gRPC
+            - { ContainerPort: 4318, Protocol: tcp }    # OTLP HTTP (what the services use)
+          Environment:
+            # memory_limiter: drop data instead of crashing when traces arrive faster than they can be sent.
+            # attributes/redact: a safety net for personal data and secrets, whatever a service sends.
+            - Name: OTELCOL_CONFIG
+              Value: |
+                receivers:
+                  otlp:
+                    protocols:
+                      grpc:
+                        endpoint: 0.0.0.0:4317
+                      http:
+                        endpoint: 0.0.0.0:4318
+                processors:
+                  memory_limiter:
+                    check_interval: 1s
+                    limit_percentage: 80
+                    spike_limit_percentage: 25
+                  attributes/redact:
+                    actions:
+                      - pattern: "(?i).*(email|password|secret|token|authorization|cookie|phone).*"
+                        action: delete
+                  batch: {}
+                exporters:
+                  otlp/jaeger:
+                    endpoint: localhost:14317
+                    tls:
+                      insecure: true
+                service:
+                  # Both containers share the task's network, and Jaeger (itself an OpenTelemetry Collector) already
+                  # serves its own metrics on port 8888, the Collector's default too: two listeners on 8888 make the
+                  # second container exit at startup. The Collector's own metrics are not needed here, so they are off.
+                  telemetry:
+                    metrics:
+                      level: none
+                  pipelines:
+                    traces:
+                      receivers: [otlp]
+                      processors: [memory_limiter, attributes/redact, batch]
+                      exporters: [otlp/jaeger]
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: otel-collector
+
+  # otel-collector.<Prefix>.local -> the task's private IP
+  DiscoveryService:
+    Type: AWS::ServiceDiscovery::Service
+    Properties:
+      Name: otel-collector
+      NamespaceId: !ImportValue
+        Fn::Sub: ${Prefix}-namespace-id
+      DnsConfig:
+        DnsRecords:
+          - Type: A
+            TTL: 10
+      HealthCheckCustomConfig:
+        FailureThreshold: 1
+
+  Service:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: observability
+      Cluster: !ImportValue
+        Fn::Sub: ${Prefix}-cluster-name
+      LaunchType: FARGATE
+      PlatformVersion: LATEST
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: 1
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 0     # one task at a time: traces are in memory anyway
+        MaximumPercent: 100
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: !Ref AssignPublicIp
+          Subnets: !Split [',', !ImportValue {'Fn::Sub': '${Prefix}-subnet-ids'}]
+          SecurityGroups: [!Ref SecurityGroup]
+      ServiceRegistries:
+        - RegistryArn: !GetAtt DiscoveryService.Arn
+
+Outputs:
+  OtlpEndpoint:
+    Description: What every service sets as OTEL_EXPORTER_OTLP_ENDPOINT (inside the VPC)
+    Value: !Sub http://otel-collector.${Prefix}.local:4318
+    Export:
+      Name: !Sub ${Prefix}-otlp-endpoint
+  LogGroup:
+    Value: !Ref LogGroup

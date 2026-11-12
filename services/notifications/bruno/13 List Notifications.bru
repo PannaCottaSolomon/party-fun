@@ -1,0 +1,28 @@
+meta {
+  name: List Notifications
+  type: http
+  seq: 13
+}
+
+get {
+  url: {{baseUrl}}/notifications?email=participant@example.com
+  body: none
+  auth: none
+}
+
+params:query {
+  email: participant@example.com
+}
+
+headers {
+  X-API-Key: {{apiKey}}
+}
+
+assert {
+  res.status: eq 200
+}
+
+docs {
+  The notification log: every email sent to (or failed for) this address, newest first.
+  Also filter by type or notification_id, e.g. ?type=refund. Answers "did Alex get the email?"
+}

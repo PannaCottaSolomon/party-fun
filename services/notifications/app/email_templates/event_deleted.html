@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% block heading %}Event cancelled{% endblock %}
+{% block body %}
+{% if audience == "participant" %}
+<p>Unfortunately, <strong>{{ event_title }}</strong> has been cancelled.</p>
+{% if reason %}<p>Reason: {{ reason }}</p>{% endif %}
+<p>If you paid for this event, your refund is being processed. You'll get a separate email once it's issued.</p>
+{% else %}
+<p>Your event <strong>{{ event_title }}</strong> has been cancelled.</p>
+{% if reason %}<p>Reason: {{ reason }}</p>{% endif %}
+<p>All participants have been notified, and anyone who paid will be refunded automatically.</p>
+{% endif %}
+{% endblock %}

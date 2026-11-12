@@ -1,0 +1,464 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  party.fun Authentication Service: its PostgreSQL database on Amazon RDS, and the service on Amazon ECS (Fargate),
+  both in the account's default VPC. ECS pulls the image straight from the authentication project's GitLab container
+  registry. Needs the secrets and cognito stacks; the cluster and rabbitmq stacks are optional.
+
+Parameters:
+  Prefix:
+    Type: String
+    Default: partyfun
+    AllowedPattern: '[a-z][a-z0-9-]{1,30}'
+    Description: Name prefix for every resource and export (lowercase).
+  ImageUri:
+    Type: String
+    Description: >-
+      The Authentication Service image in the GitLab registry, tagged with the commit it was built from
+      (registry.gitlab.com/cs302-2026/g4-team2/services/authentication:<commit sha>), so every deploy of a new build
+      changes the task definition and rolls the service.
+  RegistryUsername:
+    Type: String
+    NoEcho: true
+    Description: Username of a GitLab deploy token with the read_registry scope.
+  RegistryToken:
+    Type: String
+    NoEcho: true
+    Description: The deploy token itself.
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: The default VPC (the tasks and the database run in it).
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Public subnets of that VPC for the tasks (they get a public IP to reach GitLab, CloudWatch and Cognito).
+  ExecutionRoleArn:
+    Type: String
+    Default: ''
+    Description: >-
+      An existing role ECS uses to pull the image, write logs and read the secrets (e.g. LabRole in an AWS Academy
+      Learner Lab, which can't create IAM roles). Empty: this stack creates one.
+  TaskRoleArn:
+    Type: String
+    Default: ''
+    Description: >-
+      An existing role the service itself runs as, allowed to call the Cognito admin APIs on the user pool (e.g.
+      LabRole in a Learner Lab). Empty: this stack creates one.
+  RabbitMqHost:
+    Type: String
+    Default: ''
+    Description: >-
+      The RabbitMQ broker's host name (e.g. rabbitmq.partyfun.local). Empty until the broker runs: sign-up and
+      profiles work, but the user.created / user.updated / user.deleted events are not published.
+  ServicesSecurityGroupId:
+    Type: String
+    Default: ''
+    Description: >-
+      The cluster stack's shared services security group. The broker only accepts connections from it, so set it
+      together with RabbitMqHost.
+  NamespaceId:
+    Type: String
+    Default: ''
+    Description: >-
+      The cluster stack's private DNS namespace. When set, the service is reachable inside the VPC at
+      auth.<Prefix>.local:8080.
+  AllowedOrigin:
+    Type: String
+    Default: ''
+    Description: The frontend's URL (CORS). Empty keeps the service's default (http://localhost:5173).
+  EmailVerification:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      EMAIL_VERIFICATION_ENABLED: must a new account enter the code Cognito emails? false lets anyone sign up with an
+      email address they don't own; turn it on before real users sign up.
+  AdminEmail:
+    Type: String
+    Default: ''
+    Description: >-
+      Email of the platform ADMIN the service seeds into Cognito on startup. Empty: no seeding (create the admin with
+      add-user.sh instead).
+  AdminUsername:
+    Type: String
+    Default: admin
+    AllowedPattern: '[^@\s]+'
+    Description: The admin's Cognito username (the pool signs in with usernames, so not an email address).
+  OtlpEndpoint:
+    Type: String
+    Default: ''
+    Description: >-
+      The observability stack's OpenTelemetry Collector (output OtlpEndpoint), where the service sends its traces.
+      Empty: tracing is off (no spans are recorded or sent).
+  DesiredCount:
+    Type: Number
+    Default: 1
+    MinValue: 0
+    Description: Number of running tasks (0 stops the service but keeps the database).
+  DatabaseInstanceClass:
+    Type: String
+    Default: db.t4g.micro
+    Description: RDS instance class of the auth database.
+
+Conditions:
+  CreateExecutionRole: !Equals [!Ref ExecutionRoleArn, '']
+  CreateTaskRole: !Equals [!Ref TaskRoleArn, '']
+  HasRabbitMq: !Not [!Equals [!Ref RabbitMqHost, '']]
+  HasServicesSecurityGroup: !Not [!Equals [!Ref ServicesSecurityGroupId, '']]
+  HasNamespace: !Not [!Equals [!Ref NamespaceId, '']]
+  HasAllowedOrigin: !Not [!Equals [!Ref AllowedOrigin, '']]
+  SeedAdmin: !Not [!Equals [!Ref AdminEmail, '']]
+  HasOtlp: !Not [!Equals [!Ref OtlpEndpoint, '']]
+
+Resources:
+  # ECS logs in to registry.gitlab.com with this on every image pull (the CI job token expires with the job).
+  RegistrySecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub ${Prefix}/auth-registry
+      Description: GitLab deploy token (read_registry) ECS uses to pull the Authentication Service image.
+      SecretString: !Sub '{"username":"${RegistryUsername}","password":"${RegistryToken}"}'
+
+  # The seeded admin's password, generated so it never appears in a parameter or the repository. It meets the user
+  # pool's policy (upper, lower, digit). It only applies when the service creates the admin: an admin that already
+  # exists in Cognito (e.g. made with add-user.sh) keeps its own password.
+  AdminSecret:
+    Type: AWS::SecretsManager::Secret
+    Condition: SeedAdmin
+    Properties:
+      Name: !Sub ${Prefix}/auth-admin
+      Description: Password of the ADMIN account the Authentication Service seeds into Cognito.
+      GenerateSecretString:
+        SecretStringTemplate: !Sub '{"username":"${AdminUsername}"}'
+        GenerateStringKey: password
+        PasswordLength: 24
+        ExcludePunctuation: true
+        RequireEachIncludedType: true
+
+  # ---- Security groups: the only link between the service and its database ----
+
+  # No load balancer: the task's public IP serves the API on port 8080 (/user needs a Cognito token).
+  ServiceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Authentication Service tasks (HTTP API on port 8080)
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          CidrIp: 0.0.0.0/0
+
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Auth database (PostgreSQL from the Authentication Service tasks only)
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref ServiceSecurityGroup
+
+  # ---- Database: PostgreSQL 17 (as for the Event Service; RDS no longer creates 16), not public, encrypted ----
+
+  # No DBSubnetGroupName: RDS uses the default VPC's subnets. The credentials are the shared application user from
+  # the secrets stack (partyfun/database), so the database and the task definition can't drift apart. Deleting the
+  # stack, or a change that replaces the instance, keeps a final snapshot.
+  Database:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: !Sub ${Prefix}-auth-db
+      Engine: postgres
+      EngineVersion: '17.11'
+      DBInstanceClass: !Ref DatabaseInstanceClass
+      AllocatedStorage: '20'
+      StorageType: gp3
+      StorageEncrypted: true
+      DBName: authdb
+      MasterUsername: !Sub '{{resolve:secretsmanager:${Prefix}/database:SecretString:username}}'
+      MasterUserPassword: !Sub '{{resolve:secretsmanager:${Prefix}/database:SecretString:password}}'
+      VPCSecurityGroups:
+        - !Ref DatabaseSecurityGroup
+      PubliclyAccessible: false
+      MultiAZ: false
+      BackupRetentionPeriod: 1
+      AutoMinorVersionUpgrade: true
+      CopyTagsToSnapshot: true
+
+  # ---- ECS: one Fargate service ----
+
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub ${Prefix}-auth
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/${Prefix}/auth
+      RetentionInDays: 14
+
+  # Pulls the image, writes the logs, and reads only the secrets the task needs.
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Condition: CreateExecutionRole
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: read-secrets
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref RegistrySecret
+                  - Fn::ImportValue: !Sub ${Prefix}-database-secret-arn
+                  - Fn::ImportValue: !Sub ${Prefix}-rabbitmq-secret-arn
+                  - !If [SeedAdmin, !Ref AdminSecret, !Ref AWS::NoValue]
+
+  # Unlike Events and Payment, this service calls AWS itself: the Cognito admin APIs that confirm sign-ups, assign
+  # role groups, seed the admin and delete accounts. Only on this user pool. (Login, refresh and logout are public
+  # Cognito APIs and need no permission.)
+  TaskRole:
+    Type: AWS::IAM::Role
+    Condition: CreateTaskRole
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: cognito-admin
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cognito-idp:AdminAddUserToGroup
+                  - cognito-idp:AdminConfirmSignUp
+                  - cognito-idp:AdminCreateUser
+                  - cognito-idp:AdminDeleteUser
+                  - cognito-idp:AdminGetUser
+                  - cognito-idp:AdminListGroupsForUser
+                  - cognito-idp:AdminSetUserPassword
+                  - cognito-idp:AdminUpdateUserAttributes
+                  - cognito-idp:CreateGroup
+                  - cognito-idp:ListGroups
+                  - cognito-idp:ListUsers
+                Resource:
+                  Fn::ImportValue: !Sub ${Prefix}-user-pool-arn
+
+  # Passwords are injected by ECS from Secrets Manager at task start; they never appear in the task definition.
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub ${Prefix}-auth
+      RequiresCompatibilities:
+        - FARGATE
+      NetworkMode: awsvpc
+      Cpu: '512'
+      Memory: '1024'
+      RuntimePlatform:
+        CpuArchitecture: X86_64
+        OperatingSystemFamily: LINUX
+      ExecutionRoleArn: !If [CreateExecutionRole, !GetAtt ExecutionRole.Arn, !Ref ExecutionRoleArn]
+      TaskRoleArn: !If [CreateTaskRole, !GetAtt TaskRole.Arn, !Ref TaskRoleArn]
+      ContainerDefinitions:
+        - Name: auth
+          Image: !Ref ImageUri
+          RepositoryCredentials:
+            CredentialsParameter: !Ref RegistrySecret
+          Essential: true
+          PortMappings:
+            - ContainerPort: 8080
+              Protocol: tcp
+          # No load balancer, so ECS judges the task by its health check: the database and, once configured, the
+          # broker (the same check as the image's own HEALTHCHECK). StartPeriod covers the JVM's startup on 0.5 vCPU.
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - wget -q -O /dev/null http://127.0.0.1:8080/actuator/health || exit 1
+            Interval: 15
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 120
+          Environment:
+            - Name: DB_HOST
+              Value: !GetAtt Database.Endpoint.Address
+            - Name: DB_PORT
+              Value: !GetAtt Database.Endpoint.Port
+            - Name: DB_NAME
+              Value: authdb
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+            - Name: COGNITO_USER_POOL_ID
+              Value:
+                Fn::ImportValue: !Sub ${Prefix}-user-pool-id
+            - Name: COGNITO_CLIENT_ID
+              Value:
+                Fn::ImportValue: !Sub ${Prefix}-app-client-id
+            - Name: EMAIL_VERIFICATION_ENABLED
+              Value: !Ref EmailVerification
+            # Without a broker the health check would report it DOWN and ECS would keep replacing the task.
+            - !If
+              - HasRabbitMq
+              - Name: RABBITMQ_HOST
+                Value: !Ref RabbitMqHost
+              - Name: MANAGEMENT_HEALTH_RABBIT_ENABLED
+                Value: 'false'
+            - !If
+              - HasAllowedOrigin
+              - Name: CORS_ALLOWED_ORIGINS
+                Value: !Ref AllowedOrigin
+              - !Ref AWS::NoValue
+            - !If
+              - SeedAdmin
+              - Name: ADMIN_BOOTSTRAP_EMAIL
+                Value: !Ref AdminEmail
+              - !Ref AWS::NoValue
+            - !If
+              - SeedAdmin
+              - Name: ADMIN_BOOTSTRAP_USERNAME
+                Value: !Ref AdminUsername
+              - !Ref AWS::NoValue
+            # Tracing (observability stack): spans go to the OpenTelemetry Collector, tagged with the image's commit.
+            # Without the collector, sampling 0 records nothing instead of failing to send to localhost.
+            - Name: TRACING_SAMPLING_PROBABILITY
+              Value: !If [HasOtlp, '1.0', '0.0']
+            - !If
+              - HasOtlp
+              - Name: OTEL_EXPORTER_OTLP_ENDPOINT
+                Value: !Ref OtlpEndpoint
+              - !Ref AWS::NoValue
+            - Name: OTEL_RESOURCE_ATTRIBUTES
+              Value: !Sub
+                - deployment.environment.name=aws,service.version=${Version}
+                - Version: !Select [1, !Split [':', !Ref ImageUri]]
+          Secrets:
+            - Name: DB_USERNAME
+              ValueFrom: !Sub
+                - '${Arn}:username::'
+                - Arn:
+                    Fn::ImportValue: !Sub ${Prefix}-database-secret-arn
+            - Name: DB_PASSWORD
+              ValueFrom: !Sub
+                - '${Arn}:password::'
+                - Arn:
+                    Fn::ImportValue: !Sub ${Prefix}-database-secret-arn
+            - Name: RABBITMQ_USERNAME
+              ValueFrom: !Sub
+                - '${Arn}:username::'
+                - Arn:
+                    Fn::ImportValue: !Sub ${Prefix}-rabbitmq-secret-arn
+            - Name: RABBITMQ_PASSWORD
+              ValueFrom: !Sub
+                - '${Arn}:password::'
+                - Arn:
+                    Fn::ImportValue: !Sub ${Prefix}-rabbitmq-secret-arn
+            # No password (AdminEmail empty): the service skips seeding the admin.
+            - !If
+              - SeedAdmin
+              - Name: ADMIN_BOOTSTRAP_PASSWORD
+                ValueFrom: !Sub '${AdminSecret}:password::'
+              - !Ref AWS::NoValue
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: auth
+
+  # auth.<Prefix>.local -> the running tasks' private IPs (A), and IP + port (SRV) for API Gateway's private
+  # integration, which looks the tasks up here (only with the cluster stack's namespace).
+  DiscoveryService:
+    Type: AWS::ServiceDiscovery::Service
+    Condition: HasNamespace
+    Properties:
+      Name: auth
+      NamespaceId: !Ref NamespaceId
+      DnsConfig:
+        DnsRecords:
+          - Type: A
+            TTL: 10
+          - Type: SRV
+            TTL: 10
+      HealthCheckCustomConfig:
+        FailureThreshold: 1
+
+  # Rolling deploy: the new task must become healthy before the old one stops. If it never does, the circuit breaker
+  # rolls back to the previous task definition and the CloudFormation update fails.
+  Service:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: auth
+      Cluster: !Ref Cluster
+      LaunchType: FARGATE
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: !Ref DesiredCount
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets: !Ref SubnetIds
+          # The shared services group lets the tasks reach the broker (it accepts 5672 only from that group).
+          SecurityGroups: !If
+            - HasServicesSecurityGroup
+            - [!Ref ServiceSecurityGroup, !Ref ServicesSecurityGroupId]
+            - [!Ref ServiceSecurityGroup]
+      ServiceRegistries: !If
+        - HasNamespace
+        - - RegistryArn: !GetAtt DiscoveryService.Arn
+            ContainerName: auth
+            ContainerPort: 8080
+        - !Ref AWS::NoValue
+      PropagateTags: SERVICE
+
+Outputs:
+  ClusterName:
+    Value: !Ref Cluster
+    Export:
+      Name: !Sub ${Prefix}-auth-cluster
+  ServiceName:
+    Value: !GetAtt Service.Name
+  DatabaseEndpoint:
+    Description: The auth database's host name (reachable from the Authentication Service tasks only)
+    Value: !GetAtt Database.Endpoint.Address
+    Export:
+      Name: !Sub ${Prefix}-auth-db-endpoint
+  InternalUrl:
+    Condition: HasNamespace
+    Description: The service's address inside the VPC
+    Value: !Sub http://auth.${Prefix}.local:8080
+  DiscoveryServiceArn:
+    Condition: HasNamespace
+    Description: The Cloud Map service API Gateway routes to (api stack)
+    Value: !GetAtt DiscoveryService.Arn
+    Export:
+      Name: !Sub ${Prefix}-auth-discovery-arn
+  AdminSecretArn:
+    Condition: SeedAdmin
+    Description: The seeded admin's password (Secrets Manager)
+    Value: !Ref AdminSecret
+  LogGroupName:
+    Value: !Ref LogGroup
+  ImageUri:
+    Description: The image the service runs
+    Value: !Ref ImageUri

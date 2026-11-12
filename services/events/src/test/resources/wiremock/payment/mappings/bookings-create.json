@@ -1,0 +1,19 @@
+{
+  "name": "POST /bookings: a PENDING payment-side booking. The stub keeps no state, so its bookingId is the request's userId (unique per user, predictable in tests)",
+  "priority": 5,
+  "request": {
+    "method": "POST",
+    "url": "/bookings",
+    "bodyPatterns": [
+      { "matchesJsonPath": "$.userId" },
+      { "matchesJsonPath": "$.eventId" },
+      { "matchesJsonPath": "$.totalAmount" }
+    ]
+  },
+  "response": {
+    "status": 201,
+    "headers": { "Content-Type": "application/json" },
+    "body": "{\"bookingId\": {{jsonPath request.body '$.userId'}}, \"userId\": {{jsonPath request.body '$.userId'}}, \"eventId\": {{jsonPath request.body '$.eventId'}}, \"quantity\": {{jsonPath request.body '$.quantity'}}, \"totalAmount\": {{jsonPath request.body '$.totalAmount'}}, \"currency\": \"SGD\", \"status\": \"PENDING\"}",
+    "transformers": ["response-template"]
+  }
+}

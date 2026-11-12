@@ -1,0 +1,154 @@
+####################################################################
+# CI/CD pipeline for the admin web frontend (React + Vite + TypeScript).
+#
+#   static_analysis   ESLint, TypeScript type check, npm audit, and
+#                     GitLab's SAST and secret detection scanners.
+#   test              Vitest unit tests and a production build.
+#   release           build the nginx Docker image, push it to this
+#                     project's GitLab container registry, produce an
+#                     SBOM, and scan the image for known vulnerabilities.
+#
+# There is deliberately no deploy stage: releasing means publishing the
+# container image only.
+####################################################################
+
+include:
+  - template: Jobs/SAST.gitlab-ci.yml
+  - template: Jobs/Secret-Detection.gitlab-ci.yml
+
+stages:
+  - static_analysis
+  - test
+  - release
+
+.node:
+  image: node:22-alpine
+  cache:
+    key:
+      files:
+        - package-lock.json
+    paths:
+      - .npm/
+  before_script:
+    - npm ci --cache .npm --prefer-offline
+
+####################################################################
+# Static analysis
+####################################################################
+
+lint:
+  extends: .node
+  stage: static_analysis
+  script:
+    - npm run lint
+
+typecheck:
+  extends: .node
+  stage: static_analysis
+  script:
+    - npx tsc -b
+
+dependency-scan:
+  extends: .node
+  stage: static_analysis
+  before_script: []
+  script:
+    # Only the lockfile is needed; no install. pipefail keeps npm's exit code through tee.
+    - set -o pipefail
+    - npm audit --audit-level=high | tee npm_audit_report.txt
+  artifacts:
+    when: always
+    paths:
+      - npm_audit_report.txt
+  # A CVE can be published overnight against a library pinned months ago,
+  # with no fixed version available yet. Blocking every push on that would
+  # stop the team, so this job reports rather than halts.
+  allow_failure: true
+
+# GitLab's security templates put their jobs in the 'test' stage. These
+# two blocks re-declare the jobs by name, which merges the new key into
+# the template's definition rather than replacing it, so all that changes
+# is which stage they run in.
+semgrep-sast:
+  stage: static_analysis
+
+secret_detection:
+  stage: static_analysis
+
+####################################################################
+# Test
+####################################################################
+
+unit-tests:
+  extends: .node
+  stage: test
+  script:
+    - npx vitest run --reporter=default --reporter=junit --outputFile.junit=junit.xml
+  artifacts:
+    when: always
+    reports:
+      junit: junit.xml
+
+build:
+  extends: .node
+  stage: test
+  script:
+    - npm run build
+  artifacts:
+    paths:
+      - dist/
+    expire_in: 1 week
+
+####################################################################
+# Release (publish the image only - no deployment)
+####################################################################
+
+# based on: https://gitlab.com/gitlab-org/gitlab/-/blob/master/lib/gitlab/ci/templates/Docker.gitlab-ci.yml
+release-image:
+  stage: release
+  image: docker:29.6.2
+  services:
+    - docker:29.6.2-dind
+  variables:
+    IMAGE: "$CI_REGISTRY_IMAGE/$CI_COMMIT_REF_SLUG:$CI_COMMIT_SHA"
+  before_script:
+    # The password goes in on stdin rather than as an argument, so that
+    # it never appears in the runner's process list.
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin $CI_REGISTRY
+    - wget -qO install.sh https://raw.githubusercontent.com/anchore/syft/main/install.sh
+    - sh install.sh -b /usr/local/bin v1.50.0
+  script:
+    # VITE_PAYMENT_API_URL is baked into the static files. Set it as a CI/CD
+    # variable for other environments; it defaults to http://localhost:8080.
+    - docker build --pull --build-arg VITE_PAYMENT_API_URL="${VITE_PAYMENT_API_URL:-http://localhost:8080}" -t "$IMAGE" .
+    - docker push "$IMAGE"
+    - docker save "$IMAGE" -o image.tar
+    - syft docker-archive:image.tar -o cyclonedx-json=sbom.json
+  artifacts:
+    when: on_success
+    paths:
+      - sbom.json
+
+container-scan:
+  stage: release
+  needs: ["release-image"]
+  image:
+    name: aquasec/trivy:latest
+    entrypoint: [""]
+  variables:
+    # Must match release-image's tag.
+    IMAGE: "$CI_REGISTRY_IMAGE/$CI_COMMIT_REF_SLUG:$CI_COMMIT_SHA"
+    TRIVY_USERNAME: $CI_REGISTRY_USER
+    TRIVY_PASSWORD: $CI_REGISTRY_PASSWORD
+    TRIVY_AUTH_URL: $CI_REGISTRY
+    TRIVY_NO_PROGRESS: "true"
+  script:
+    # Report CRITICAL vulnerabilities that already have a fix.
+    - set -o pipefail
+    - trivy image --exit-code 1 --severity CRITICAL --ignore-unfixed "$IMAGE" | tee trivy_report.txt
+  artifacts:
+    when: always
+    paths:
+      - trivy_report.txt
+  # Same reasoning as dependency-scan: report, don't block the team.
+  allow_failure: true

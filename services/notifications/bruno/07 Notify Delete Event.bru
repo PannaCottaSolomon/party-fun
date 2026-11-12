@@ -1,0 +1,36 @@
+meta {
+  name: Notify Delete Event
+  type: http
+  seq: 7
+}
+
+post {
+  url: {{baseUrl}}/notify_delete_event
+  body: json
+  auth: none
+}
+
+headers {
+  X-API-Key: {{apiKey}}
+}
+
+body:json {
+  {
+    "notification_id": "event_deleted-{{runId}}",
+    "email": "participant@example.com",
+    "name": "Alex",
+    "event_title": "Off-campus Beach Day",
+    "event_id": 77,
+    "reason": "Not enough sign-ups by the deadline",
+    "audience": "participant"
+  }
+}
+
+script:pre-request {
+  bru.setVar("runId", Date.now());
+}
+
+assert {
+  res.status: eq 200
+  res.body.status: eq sent
+}

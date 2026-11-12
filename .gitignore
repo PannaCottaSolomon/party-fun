@@ -1,0 +1,21 @@
+# IDE & OS files
+.idea/
+.vscode/
+.DS_Store
+
+# Environment secrets
+.env
+*.env
+!*.env.example
+
+# Dependencies & builds
+node_modules/
+dist/
+build/
+
+# Python
+__pycache__/
+*.pyc
+
+# Course materials, demo videos & submission bundles (large; the zip also bundles .env files)
+/docs/

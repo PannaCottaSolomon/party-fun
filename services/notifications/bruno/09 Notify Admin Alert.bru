@@ -1,0 +1,36 @@
+meta {
+  name: Notify Admin Alert
+  type: http
+  seq: 9
+}
+
+post {
+  url: {{baseUrl}}/notify_admin_alert
+  body: json
+  auth: none
+}
+
+headers {
+  X-API-Key: {{apiKey}}
+}
+
+body:json {
+  {
+    "notification_id": "admin_alert-{{runId}}",
+    "source": "payment-service",
+    "error": "Refund failed after 3 retries",
+    "details": {
+      "registration_id": 1001,
+      "stripe_error": "charge_already_refunded"
+    }
+  }
+}
+
+script:pre-request {
+  bru.setVar("runId", Date.now());
+}
+
+assert {
+  res.status: eq 200
+  res.body.status: eq sent
+}

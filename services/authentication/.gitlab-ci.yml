@@ -1,0 +1,183 @@
+####################################################################################################################
+# CI/CD pipeline for the Authentication Service (Java 17 / Spring Boot 3).
+#
+# Test and scan the exact container image that is promoted to the registry. Release tags are published only from
+# the default branch or a Git tag; branch pipelines still compile, test, build, and scan the image.
+####################################################################################################################
+
+include:
+  - template: Jobs/SAST.gitlab-ci.yml
+  - template: Jobs/Secret-Detection.gitlab-ci.yml
+
+stages:
+  - lint
+  - static-analysis
+  - test
+  - package
+  - scan
+  - release
+
+workflow:
+  rules:
+    - if: $CI_COMMIT_TAG
+    - if: $CI_COMMIT_BRANCH
+
+variables:
+  MAVEN_IMAGE: maven:3.9-eclipse-temurin-17
+  DOCKER_IMAGE: docker:29.9.1
+  DIND_IMAGE: docker:29.9.1-dind
+  TRIVY_IMAGE: aquasec/trivy:0.76.0
+  HADOLINT_IMAGE: hadolint/hadolint:v2.14.0-debian
+  MAVEN_OPTS: -Dmaven.repo.local=$CI_PROJECT_DIR/.m2/repository
+  MAVEN_CLI_OPTS: --batch-mode --no-transfer-progress --errors
+  IMAGE: $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
+
+default:
+  interruptible: true
+  retry:
+    max: 1
+    when: [runner_system_failure, stuck_or_timeout_failure, scheduler_failure]
+
+.maven:
+  image: $MAVEN_IMAGE
+  cache:
+    key:
+      files: [pom.xml]
+    paths: [.m2/repository]
+
+.dind:
+  services:
+    - name: $DIND_IMAGE
+      alias: docker
+      command: ["--tls=false"]
+      variables:
+        HEALTHCHECK_TCP_PORT: "2375"
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+
+.registry-login:
+  before_script:
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+
+hadolint:
+  stage: lint
+  image: $HADOLINT_IMAGE
+  needs: []
+  script:
+    - hadolint Dockerfile
+
+spotbugs:
+  extends: .maven
+  stage: static-analysis
+  needs: []
+  script:
+    - mvn $MAVEN_CLI_OPTS clean compile com.github.spotbugs:spotbugs-maven-plugin:4.10.5.0:spotbugs -Dspotbugs.xmlOutput=true
+  artifacts:
+    when: always
+    paths:
+      - target/spotbugsXml.xml
+    expire_in: 1 week
+
+unit-tests:
+  extends: .maven
+  stage: test
+  needs: []
+  script:
+    - mvn $MAVEN_CLI_OPTS test
+  artifacts:
+    when: always
+    reports:
+      junit: target/surefire-reports/TEST-*.xml
+    expire_in: 1 week
+
+integration-tests:
+  extends: .maven
+  stage: test
+  needs: []
+  script:
+    - mvn $MAVEN_CLI_OPTS verify
+  artifacts:
+    when: always
+    reports:
+      junit: target/surefire-reports/TEST-*.xml
+    expire_in: 1 week
+
+build-image:
+  extends: [.dind, .registry-login]
+  stage: package
+  image: $DOCKER_IMAGE
+  needs: [hadolint, spotbugs, unit-tests, integration-tests]
+  script:
+    - docker pull "$CI_REGISTRY_IMAGE:latest" || true
+    - >
+      docker build --pull
+      --cache-from "$CI_REGISTRY_IMAGE:latest"
+      --build-arg BUILDKIT_INLINE_CACHE=1
+      --label "org.opencontainers.image.source=$CI_PROJECT_URL"
+      --label "org.opencontainers.image.revision=$CI_COMMIT_SHA"
+      --label "org.opencontainers.image.created=$CI_PIPELINE_CREATED_AT"
+      --tag "$IMAGE"
+      .
+    - sh ci/smoke-test.sh "$IMAGE"
+    - docker push "$IMAGE"
+
+container-scan:
+  stage: scan
+  image:
+    name: $TRIVY_IMAGE
+    entrypoint: [""]
+  needs: [build-image]
+  variables:
+    TRIVY_USERNAME: $CI_REGISTRY_USER
+    TRIVY_PASSWORD: $CI_REGISTRY_PASSWORD
+    TRIVY_AUTH_URL: $CI_REGISTRY
+    TRIVY_NO_PROGRESS: "true"
+    TRIVY_CACHE_DIR: .trivycache/
+  cache:
+    key: trivy-db
+    paths: [.trivycache/]
+  script:
+    - trivy image --exit-code 0 --severity HIGH,CRITICAL --output trivy-report.txt "$IMAGE"
+    - trivy image --exit-code 0 --format cyclonedx --output sbom.cdx.json "$IMAGE"
+    - cat trivy-report.txt
+    - trivy image --exit-code 1 --severity CRITICAL --ignore-unfixed "$IMAGE"
+  artifacts:
+    when: always
+    paths: [trivy-report.txt, sbom.cdx.json]
+    reports:
+      cyclonedx: sbom.cdx.json
+    expire_in: 30 days
+
+release-image:
+  extends: [.dind, .registry-login]
+  stage: release
+  image: $DOCKER_IMAGE
+  needs: [build-image, container-scan]
+  interruptible: false
+  resource_group: release
+  rules:
+    - if: $CI_COMMIT_TAG
+      variables:
+        RELEASE_TAG: $CI_COMMIT_TAG
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      variables:
+        RELEASE_TAG: latest
+  script:
+    - docker pull "$IMAGE"
+    - docker tag "$IMAGE" "$CI_REGISTRY_IMAGE:$RELEASE_TAG"
+    - docker push "$CI_REGISTRY_IMAGE:$RELEASE_TAG"
+    - echo "Released $CI_REGISTRY_IMAGE:$RELEASE_TAG (from $IMAGE)"
+
+release:
+  stage: release
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  needs: [release-image]
+  rules:
+    - if: $CI_COMMIT_TAG
+  script:
+    - echo "Creating GitLab release for $CI_COMMIT_TAG"
+  release:
+    tag_name: "$CI_COMMIT_TAG"
+    name: "Authentication service $CI_COMMIT_TAG"
+    description: "Container image: $CI_REGISTRY_IMAGE:$CI_COMMIT_TAG"

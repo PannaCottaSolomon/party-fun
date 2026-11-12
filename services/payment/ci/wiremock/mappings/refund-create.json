@@ -1,0 +1,14 @@
+{
+  "priority": 9,
+  "request": {
+    "method": "POST",
+    "urlPath": "/v1/refunds"
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "application/json"
+    },
+    "body": "{\"id\": \"re_{{request.headers.[Idempotency-Key]}}\", \"object\": \"refund\", \"status\": \"succeeded\", \"payment_intent\": \"{{formData request.body 'form' urlDecode=true}}{{form.payment_intent}}\"}"
+  }
+}

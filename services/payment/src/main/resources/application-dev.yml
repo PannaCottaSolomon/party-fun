@@ -1,0 +1,11 @@
+# Local development against the developer's existing MySQL `payment` database.
+# The tables already exist: Hibernate only VALIDATES them and never creates, alters, drops or truncates.
+
+spring:
+  jpa:
+    hibernate:
+      ddl-auto: validate
+
+logging:
+  level:
+    payment: DEBUG

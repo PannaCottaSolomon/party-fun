@@ -1,0 +1,14 @@
+Flask>=3.0,<4
+pika>=1.3,<2
+requests>=2.31,<3
+waitress>=3.0,<4
+# MySQL driver for the notification log on AWS RDS ([rsa] adds MySQL 8 password support)
+PyMySQL[rsa]>=1.1,<2
+
+# Tracing (only active when OTEL_ENABLED=true; see README)
+opentelemetry-distro
+opentelemetry-exporter-otlp
+opentelemetry-instrumentation-flask
+opentelemetry-instrumentation-pika
+opentelemetry-instrumentation-pymysql
+opentelemetry-instrumentation-requests

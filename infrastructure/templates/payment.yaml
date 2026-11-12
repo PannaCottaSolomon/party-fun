@@ -1,0 +1,402 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  party.fun Payment Service: its MySQL database on Amazon RDS, and the service on Amazon ECS (Fargate), both in the
+  account's default VPC. ECS pulls the image straight from the payment project's GitLab container registry.
+  Needs the secrets stack (Stripe sandbox keys set in partyfun/payment) and the cognito stack (Admin logins); the
+  cluster and rabbitmq stacks are optional.
+
+Parameters:
+  Prefix:
+    Type: String
+    Default: partyfun
+    AllowedPattern: '[a-z][a-z0-9-]{1,30}'
+    Description: Name prefix for every resource and export (lowercase).
+  ImageUri:
+    Type: String
+    Description: >-
+      The Payment Service image in the GitLab registry, tagged with the commit it was built from
+      (registry.gitlab.com/cs302-2026/g4-team2/services/payment/main:<commit sha>), so every deploy of a new build
+      changes the task definition and rolls the service.
+  RegistryUsername:
+    Type: String
+    NoEcho: true
+    Description: Username of a GitLab deploy token with the read_registry scope.
+  RegistryToken:
+    Type: String
+    NoEcho: true
+    Description: The deploy token itself.
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: The default VPC (the tasks and the database run in it).
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Public subnets of that VPC for the tasks (they get a public IP to reach GitLab, CloudWatch and Stripe).
+  ExecutionRoleArn:
+    Type: String
+    Default: ''
+    Description: >-
+      An existing role ECS uses to pull the image, write logs and read the secrets (e.g. LabRole in an AWS Academy
+      Learner Lab, which can't create IAM roles). Empty: this stack creates one.
+  RabbitMqHost:
+    Type: String
+    Default: ''
+    Description: >-
+      The RabbitMQ broker's host name (e.g. rabbitmq.partyfun.local). Empty until the broker runs: payments work, but
+      automatic refunds of cancelled events and refund notifications don't.
+  ServicesSecurityGroupId:
+    Type: String
+    Default: ''
+    Description: >-
+      The cluster stack's shared services security group. The broker only accepts connections from it, so set it
+      together with RabbitMqHost.
+  NamespaceId:
+    Type: String
+    Default: ''
+    Description: >-
+      The cluster stack's private DNS namespace. When set, the service is reachable inside the VPC at
+      payment.<Prefix>.local:8080 (a stable EVENTS_PAYMENT_BASE_URL for the Event Service).
+  AllowedOrigin:
+    Type: String
+    Default: ''
+    Description: The frontend's URL (CORS). Empty keeps the service's default (http://localhost:5173).
+  OtlpEndpoint:
+    Type: String
+    Default: ''
+    Description: >-
+      The observability stack's OpenTelemetry Collector (output OtlpEndpoint), where the service sends its traces.
+      Empty: tracing is off (no spans are recorded or sent).
+  DesiredCount:
+    Type: Number
+    Default: 1
+    MinValue: 0
+    Description: Number of running tasks (0 stops the service but keeps the database).
+  DatabaseInstanceClass:
+    Type: String
+    Default: db.t4g.micro
+    Description: RDS instance class of the payment database.
+
+Conditions:
+  CreateExecutionRole: !Equals [!Ref ExecutionRoleArn, '']
+  HasRabbitMq: !Not [!Equals [!Ref RabbitMqHost, '']]
+  HasServicesSecurityGroup: !Not [!Equals [!Ref ServicesSecurityGroupId, '']]
+  HasNamespace: !Not [!Equals [!Ref NamespaceId, '']]
+  HasAllowedOrigin: !Not [!Equals [!Ref AllowedOrigin, '']]
+  HasOtlp: !Not [!Equals [!Ref OtlpEndpoint, '']]
+
+Resources:
+  # ECS logs in to registry.gitlab.com with this on every image pull (the CI job token expires with the job).
+  RegistrySecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub ${Prefix}/payment-registry
+      Description: GitLab deploy token (read_registry) ECS uses to pull the Payment Service image.
+      SecretString: !Sub '{"username":"${RegistryUsername}","password":"${RegistryToken}"}'
+
+  # ---- Security groups: the only link between the service and its database ----
+
+  # No load balancer: the task's public IP serves the API on port 8080.
+  ServiceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Payment Service tasks (HTTP API on port 8080)
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          CidrIp: 0.0.0.0/0
+
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Payment database (MySQL from the Payment Service tasks only)
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref ServiceSecurityGroup
+
+  # ---- Database: MySQL 8.4 (as in the service's ci/compose.test.yaml), not public, encrypted ----
+
+  # No DBSubnetGroupName: RDS uses the default VPC's subnets. The credentials are the shared application user from
+  # the secrets stack (partyfun/database), so the database and the task definition can't drift apart. Deleting the
+  # stack, or a change that replaces the instance, keeps a final snapshot.
+  Database:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: !Sub ${Prefix}-payment-db
+      Engine: mysql
+      EngineVersion: '8.4'
+      DBInstanceClass: !Ref DatabaseInstanceClass
+      AllocatedStorage: '20'
+      StorageType: gp3
+      StorageEncrypted: true
+      DBName: payment
+      MasterUsername: !Sub '{{resolve:secretsmanager:${Prefix}/database:SecretString:username}}'
+      MasterUserPassword: !Sub '{{resolve:secretsmanager:${Prefix}/database:SecretString:password}}'
+      VPCSecurityGroups:
+        - !Ref DatabaseSecurityGroup
+      PubliclyAccessible: false
+      MultiAZ: false
+      BackupRetentionPeriod: 1
+      AutoMinorVersionUpgrade: true
+      CopyTagsToSnapshot: true
+
+  # ---- ECS: one Fargate service ----
+
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub ${Prefix}-payment
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/${Prefix}/payment
+      RetentionInDays: 14
+
+  # Pulls the image, writes the logs, and reads only the secrets the task needs. The service itself calls no AWS API
+  # (Stripe is reached over the internet), so the task has no role of its own.
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Condition: CreateExecutionRole
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: read-secrets
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref RegistrySecret
+                  - Fn::ImportValue: !Sub ${Prefix}-payment-secret-arn
+                  - Fn::ImportValue: !Sub ${Prefix}-payment-service-key-secret-arn
+                  - Fn::ImportValue: !Sub ${Prefix}-database-secret-arn
+                  - Fn::ImportValue: !Sub ${Prefix}-rabbitmq-secret-arn
+
+  # Keys and passwords are injected by ECS from Secrets Manager at task start; they never appear in the task
+  # definition. The variable names are the service's own (the same lowercase names as the local .env).
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub ${Prefix}-payment
+      RequiresCompatibilities:
+        - FARGATE
+      NetworkMode: awsvpc
+      Cpu: '512'
+      Memory: '1024'
+      RuntimePlatform:
+        CpuArchitecture: X86_64
+        OperatingSystemFamily: LINUX
+      ExecutionRoleArn: !If [CreateExecutionRole, !GetAtt ExecutionRole.Arn, !Ref ExecutionRoleArn]
+      ContainerDefinitions:
+        - Name: payment
+          Image: !Ref ImageUri
+          RepositoryCredentials:
+            CredentialsParameter: !Ref RegistrySecret
+          Essential: true
+          PortMappings:
+            - ContainerPort: 8080
+              Protocol: tcp
+          # No load balancer, so ECS judges the task by its health check. Readiness includes MySQL and RabbitMQ, so
+          # it is only used once a broker is configured; until then liveness (the process is up). StartPeriod covers
+          # the JVM's startup on 0.5 vCPU.
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - !If
+                - HasRabbitMq
+                - wget -q -O /dev/null http://127.0.0.1:8080/actuator/health/readiness || exit 1
+                - wget -q -O /dev/null http://127.0.0.1:8080/actuator/health/liveness || exit 1
+            Interval: 15
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 120
+          Environment:
+            # No profile file for prod: the base configuration (schema validation, INFO logging).
+            - Name: stage
+              Value: prod
+            - Name: db_host
+              Value: !GetAtt Database.Endpoint.Address
+            - Name: db_port
+              Value: !GetAtt Database.Endpoint.Port
+            - Name: db_name
+              Value: payment
+            # The new database is empty and the service only validates its schema; create the booking and payment
+            # tables from the entities and keep the data across restarts and deploys.
+            - Name: SPRING_JPA_HIBERNATE_DDL_AUTO
+              Value: update
+            # The Cognito user pool: Admin endpoints accept an Admin's Cognito access token (the frontend's Admin
+            # dashboard calls /admin/* through the API Gateway), verified against the pool's public keys.
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+            - Name: COGNITO_USER_POOL_ID
+              Value:
+                Fn::ImportValue: !Sub ${Prefix}-user-pool-id
+            - !If
+              - HasRabbitMq
+              - Name: rabbitmq_host
+                Value: !Ref RabbitMqHost
+              - !Ref AWS::NoValue
+            - !If
+              - HasAllowedOrigin
+              - Name: cors_allowed_origins
+                Value: !Ref AllowedOrigin
+              - !Ref AWS::NoValue
+            # Tracing (observability stack): spans go to the OpenTelemetry Collector, tagged with the image's commit.
+            # Without the collector, sampling 0 records nothing instead of failing to send to localhost.
+            - Name: TRACING_SAMPLING_PROBABILITY
+              Value: !If [HasOtlp, '1.0', '0.0']
+            - !If
+              - HasOtlp
+              - Name: OTEL_EXPORTER_OTLP_ENDPOINT
+                Value: !Ref OtlpEndpoint
+              - !Ref AWS::NoValue
+            - Name: OTEL_RESOURCE_ATTRIBUTES
+              Value: !Sub
+                - deployment.environment.name=aws,service.version=${Version}
+                - Version: !Select [1, !Split [':', !Ref ImageUri]]
+          Secrets:
+            - Name: db_user
+              ValueFrom: !Sub
+                - '${Arn}:username::'
+                - Arn:
+                    Fn::ImportValue: !Sub ${Prefix}-database-secret-arn
+            - Name: db_password
+              ValueFrom: !Sub
+                - '${Arn}:password::'
+                - Arn:
+                    Fn::ImportValue: !Sub ${Prefix}-database-secret-arn
+            - Name: rabbitmq_username
+              ValueFrom: !Sub
+                - '${Arn}:username::'
+                - Arn:
+                    Fn::ImportValue: !Sub ${Prefix}-rabbitmq-secret-arn
+            - Name: rabbitmq_password
+              ValueFrom: !Sub
+                - '${Arn}:password::'
+                - Arn:
+                    Fn::ImportValue: !Sub ${Prefix}-rabbitmq-secret-arn
+            # Stripe SANDBOX keys only (the service refuses to start with anything but sk_test_ / rk_test_).
+            - Name: stripe_secret_key
+              ValueFrom: !Sub
+                - '${Arn}:stripe_secret_key::'
+                - Arn:
+                    Fn::ImportValue: !Sub ${Prefix}-payment-secret-arn
+            - Name: stripe_webhook_secret
+              ValueFrom: !Sub
+                - '${Arn}:stripe_webhook_secret::'
+                - Arn:
+                    Fn::ImportValue: !Sub ${Prefix}-payment-secret-arn
+            - Name: stripe_publishable_key
+              ValueFrom: !Sub
+                - '${Arn}:stripe_publishable_key::'
+                - Arn:
+                    Fn::ImportValue: !Sub ${Prefix}-payment-secret-arn
+            - Name: payment_admin_api_key
+              ValueFrom: !Sub
+                - '${Arn}:payment_admin_api_key::'
+                - Arn:
+                    Fn::ImportValue: !Sub ${Prefix}-payment-secret-arn
+            - Name: payment_service_api_key
+              ValueFrom: !Sub
+                - '${Arn}:payment_service_api_key::'
+                - Arn:
+                    Fn::ImportValue: !Sub ${Prefix}-payment-service-key-secret-arn
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: payment
+
+  # payment.<Prefix>.local -> the running tasks' private IPs (A), and IP + port (SRV) for API Gateway's private
+  # integration, which looks the tasks up here (only with the cluster stack's namespace).
+  DiscoveryService:
+    Type: AWS::ServiceDiscovery::Service
+    Condition: HasNamespace
+    Properties:
+      Name: payment
+      NamespaceId: !Ref NamespaceId
+      DnsConfig:
+        DnsRecords:
+          - Type: A
+            TTL: 10
+          - Type: SRV
+            TTL: 10
+      HealthCheckCustomConfig:
+        FailureThreshold: 1
+
+  # Rolling deploy: the new task must become healthy before the old one stops. If it never does, the circuit breaker
+  # rolls back to the previous task definition and the CloudFormation update fails.
+  Service:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: payment
+      Cluster: !Ref Cluster
+      LaunchType: FARGATE
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: !Ref DesiredCount
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets: !Ref SubnetIds
+          # The shared services group lets the tasks reach the broker (it accepts 5672 only from that group).
+          SecurityGroups: !If
+            - HasServicesSecurityGroup
+            - [!Ref ServiceSecurityGroup, !Ref ServicesSecurityGroupId]
+            - [!Ref ServiceSecurityGroup]
+      ServiceRegistries: !If
+        - HasNamespace
+        - - RegistryArn: !GetAtt DiscoveryService.Arn
+            ContainerName: payment
+            ContainerPort: 8080
+        - !Ref AWS::NoValue
+      PropagateTags: SERVICE
+
+Outputs:
+  ClusterName:
+    Value: !Ref Cluster
+    Export:
+      Name: !Sub ${Prefix}-payment-cluster
+  ServiceName:
+    Value: !GetAtt Service.Name
+  DatabaseEndpoint:
+    Description: The payment database's host name (reachable from the Payment Service tasks only)
+    Value: !GetAtt Database.Endpoint.Address
+    Export:
+      Name: !Sub ${Prefix}-payment-db-endpoint
+  InternalUrl:
+    Condition: HasNamespace
+    Description: The service's address inside the VPC (EVENTS_PAYMENT_BASE_URL for the Event Service)
+    Value: !Sub http://payment.${Prefix}.local:8080
+  DiscoveryServiceArn:
+    Condition: HasNamespace
+    Description: The Cloud Map service API Gateway routes to (api stack)
+    Value: !GetAtt DiscoveryService.Arn
+    Export:
+      Name: !Sub ${Prefix}-payment-discovery-arn
+  LogGroupName:
+    Value: !Ref LogGroup
+  ImageUri:
+    Description: The image the service runs
+    Value: !Ref ImageUri

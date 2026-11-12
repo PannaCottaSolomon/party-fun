@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+{% block heading %}Welcome to {{ app_name }}{% endblock %}
+{% block body %}
+{% if role == "organiser" %}
+<p>Your organiser account is ready. You can now create events, set a minimum number of sign-ups, and get paid once your event reaches it.</p>
+{% else %}
+<p>Your account is ready. Browse upcoming events and lock in your spot. If an event doesn't go ahead, you get your money back automatically.</p>
+{% endif %}
+{% endblock %}

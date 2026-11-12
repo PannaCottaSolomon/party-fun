@@ -1,0 +1,38 @@
+meta {
+  name: Notify Signup
+  type: http
+  seq: 3
+}
+
+post {
+  url: {{baseUrl}}/notify_signup
+  body: json
+  auth: none
+}
+
+headers {
+  X-API-Key: {{apiKey}}
+}
+
+body:json {
+  {
+    "notification_id": "signup-{{runId}}",
+    "email": "participant@example.com",
+    "name": "Alex",
+    "event_title": "CCA Welcome Party",
+    "event_date": "2026-11-14T20:00:00+08:00",
+    "location": "SMU Connexion, Level 3",
+    "registration_id": 1001,
+    "amount": 1500,
+    "currency": "SGD"
+  }
+}
+
+script:pre-request {
+  bru.setVar("runId", Date.now());
+}
+
+assert {
+  res.status: eq 200
+  res.body.status: eq sent
+}

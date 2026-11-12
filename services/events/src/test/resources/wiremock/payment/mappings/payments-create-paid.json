@@ -1,0 +1,17 @@
+{
+  "name": "POST /payments with Stripe's test card pm_card_visa: PAID. The paymentId is the bookingId",
+  "priority": 5,
+  "request": {
+    "method": "POST",
+    "url": "/payments",
+    "bodyPatterns": [
+      { "matchesJsonPath": { "expression": "$.paymentMethodId", "equalTo": "pm_card_visa" } }
+    ]
+  },
+  "response": {
+    "status": 201,
+    "headers": { "Content-Type": "application/json" },
+    "body": "{\"paymentId\": {{jsonPath request.body '$.bookingId'}}, \"bookingId\": {{jsonPath request.body '$.bookingId'}}, \"currency\": \"SGD\", \"status\": \"PAID\", \"stripePaymentIntentId\": \"pi_stub_{{jsonPath request.body '$.bookingId'}}\"}",
+    "transformers": ["response-template"]
+  }
+}

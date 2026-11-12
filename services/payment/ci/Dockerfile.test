@@ -1,0 +1,13 @@
+# Integration-test runner: runs the black-box JUnit tests (src/test/java/payment/integration/*IT.java)
+# with Maven Failsafe against the Payment Service container. The tests talk to it over HTTP and to
+# RabbitMQ through its management API; they do not start the application themselves.
+FROM maven:3.9-eclipse-temurin-21
+
+WORKDIR /build
+
+# Download dependencies and test plugins first so this layer is cached until pom.xml changes.
+COPY pom.xml .
+RUN mvn -B -q -P integration dependency:go-offline
+
+COPY src ./src
+CMD ["mvn", "-B", "--no-transfer-progress", "-P", "integration", "verify"]

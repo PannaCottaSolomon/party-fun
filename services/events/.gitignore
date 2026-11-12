@@ -1,0 +1,82 @@
+### Secrets: NEVER commit these (use .env.example as the template) ###
+.env
+.env.*
+!.env.example
+*.env
+dev.env
+dev.env.*
+secrets/
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.truststore
+id_rsa*
+id_ed25519*
+# Local-only Spring profiles that may hold real credentials
+application-local.properties
+application-local.yml
+application-secret*.properties
+application-secret*.yml
+
+### Build output ###
+HELP.md
+target/
+build/
+!**/src/main/**/target/
+!**/src/test/**/target/
+!**/src/main/**/build/
+!**/src/test/**/build/
+.mvn/wrapper/maven-wrapper.jar
+.m2/
+*.class
+*.jar
+*.war
+!.mvn/wrapper/*.properties
+
+### Logs and runtime files ###
+*.log
+logs/
+*.pid
+hs_err_pid*
+replay_pid*
+docs/
+
+### STS / Eclipse ###
+.apt_generated
+.classpath
+.factorypath
+.project
+.settings
+.springBeans
+.sts4-cache
+
+### IntelliJ IDEA ###
+.idea
+*.iws
+*.iml
+*.ipr
+out/
+
+### NetBeans ###
+/nbproject/private/
+/nbbuild/
+/dist/
+/nbdist/
+/.nb-gradle/
+
+### VS Code ###
+.vscode/
+
+### AI assistant local settings ###
+.claude/settings.local.json
+
+### OS files ###
+.DS_Store
+Thumbs.db
+desktop.ini
+*~
+*.swp

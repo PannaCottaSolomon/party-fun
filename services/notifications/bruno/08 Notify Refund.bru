@@ -1,0 +1,37 @@
+meta {
+  name: Notify Refund
+  type: http
+  seq: 8
+}
+
+post {
+  url: {{baseUrl}}/notify_refund
+  body: json
+  auth: none
+}
+
+headers {
+  X-API-Key: {{apiKey}}
+}
+
+body:json {
+  {
+    "notification_id": "refund-{{runId}}",
+    "email": "participant@example.com",
+    "name": "Alex",
+    "event_title": "Off-campus Beach Day",
+    "amount": 1500,
+    "currency": "SGD",
+    "registration_id": 1001,
+    "refund_id": "re_3Pxyz"
+  }
+}
+
+script:pre-request {
+  bru.setVar("runId", Date.now());
+}
+
+assert {
+  res.status: eq 200
+  res.body.status: eq sent
+}

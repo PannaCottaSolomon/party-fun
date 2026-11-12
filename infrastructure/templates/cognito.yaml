@@ -1,0 +1,117 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  party.fun users: an Amazon Cognito user pool, an app client for the app's own login pages, and the three role
+  groups. Every token Cognito issues carries the user's groups in its "cognito:groups" claim, e.g. ["admin"].
+
+Parameters:
+  Prefix:
+    Type: String
+    Default: partyfun
+    AllowedPattern: '[a-z][a-z0-9-]{1,30}'
+    Description: Name prefix for every resource and export (lowercase).
+
+Resources:
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub ${Prefix}-users
+      # Users choose a username and can sign in with it or with their verified email address.
+      # Both are case-insensitive. Changing this replaces the pool (new IDs, all users deleted).
+      AliasAttributes:
+        - email
+      UsernameConfiguration:
+        CaseSensitive: false
+      # Participants and organisers register themselves; Cognito emails them a code to confirm the address.
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: false
+      AutoVerifiedAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+          TemporaryPasswordValidityDays: 7
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Mutable: true
+          Required: true
+        - Name: name
+          AttributeDataType: String
+          Mutable: true
+          Required: false
+
+  # For the React app's own Login / Register / Admin login pages (no Cognito hosted UI). A browser can't keep a
+  # secret, so the client has none.
+  AppClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub ${Prefix}-web
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      PreventUserExistenceErrors: ENABLED
+      EnableTokenRevocation: true
+      AccessTokenValidity: 1
+      IdTokenValidity: 1
+      RefreshTokenValidity: 7
+      TokenValidityUnits:
+        AccessToken: hours
+        IdToken: hours
+        RefreshToken: days
+
+  # The three roles. Membership is only changed with admin API calls (add-user.sh, or the Authentication Service
+  # putting a new user into participant/organiser), so nobody can make themselves an admin. A lower precedence
+  # wins if a user is ever in more than one group.
+  AdminGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      UserPoolId: !Ref UserPool
+      GroupName: admin
+      Description: Admins (failed-refunds dashboard, refunds)
+      Precedence: 10
+
+  OrganiserGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      UserPoolId: !Ref UserPool
+      GroupName: organiser
+      Description: Organisers (create, edit and cancel their own events)
+      Precedence: 20
+
+  ParticipantGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      UserPoolId: !Ref UserPool
+      GroupName: participant
+      Description: Participants (browse events, buy tickets)
+      Precedence: 30
+
+Outputs:
+  UserPoolId:
+    Value: !Ref UserPool
+    Export:
+      Name: !Sub ${Prefix}-user-pool-id
+  UserPoolArn:
+    Value: !GetAtt UserPool.Arn
+    Export:
+      Name: !Sub ${Prefix}-user-pool-arn
+  AppClientId:
+    Value: !Ref AppClient
+    Export:
+      Name: !Sub ${Prefix}-app-client-id
+  Issuer:
+    Description: The "iss" of every token from this pool; API Gateway's JWT authorizer checks it.
+    Value: !Sub https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}
+    Export:
+      Name: !Sub ${Prefix}-cognito-issuer

@@ -1,0 +1,20 @@
+# Only pom.xml and src/ are needed to build the image.
+target/
+.git/
+.gitignore
+.gitlab-ci.yml
+.idea/
+.vscode/
+*.iml
+*.log
+ci/
+README.md
+CLAUDE.md
+AGENTS.md
+
+# Never send local secrets to the Docker daemon.
+.env
+.env.*
+dev.env
+dev.env.*
+.m2/

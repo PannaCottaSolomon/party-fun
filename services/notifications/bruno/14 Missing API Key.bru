@@ -1,0 +1,28 @@
+meta {
+  name: Missing API Key
+  type: http
+  seq: 14
+}
+
+post {
+  url: {{baseUrl}}/notify_refund
+  body: json
+  auth: none
+}
+
+body:json {
+  {
+    "email": "participant@example.com",
+    "event_title": "Off-campus Beach Day",
+    "amount": 1500,
+    "registration_id": 1001
+  }
+}
+
+assert {
+  res.status: eq 401
+}
+
+docs {
+  No X-API-Key header: the service refuses to send. (Only when API_KEY is set on the service.)
+}

@@ -1,0 +1,39 @@
+# Local development: RabbitMQ + the notification service (+ Jaeger with --profile tracing)
+#
+#   cp .env.example .env
+#   docker compose up --build
+#   docker compose --profile tracing up --build     # also starts Jaeger (UI on :16686)
+
+services:
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    ports:
+      - "5672:5672"     # AMQP
+      - "15672:15672"   # management UI (guest / guest)
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  notification:
+    build: .
+    env_file: .env
+    ports:
+      - "5000:5000"
+    volumes:
+      - notification-data:/srv/data   # keeps the notification log between restarts
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+
+  jaeger:
+    image: jaegertracing/jaeger:latest
+    profiles: ["tracing"]
+    ports:
+      - "16686:16686"   # Jaeger UI
+      - "4317:4317"     # OTLP gRPC
+      - "4318:4318"     # OTLP HTTP
+
+volumes:
+  notification-data:

@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+{% block heading %}Your event is live{% endblock %}
+{% block body %}
+<p><strong>{{ event_title }}</strong> is now open for sign-ups.</p>
+<table role="presentation" cellpadding="0" cellspacing="0" style="margin:16px 0;">
+  <tr><td style="padding:4px 16px 4px 0;color:#7b8794;">When</td><td>{{ event_date | event_date }}</td></tr>
+  <tr><td style="padding:4px 16px 4px 0;color:#7b8794;">Where</td><td>{{ location }}</td></tr>
+  <tr><td style="padding:4px 16px 4px 0;color:#7b8794;">Event ID</td><td>{{ event_id }}</td></tr>
+</table>
+<p>We'll let you know if sign-ups don't reach your minimum by the deadline.</p>
+{% endblock %}

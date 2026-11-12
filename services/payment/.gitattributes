@@ -1,0 +1,2 @@
+# Shell scripts run on Linux CI runners: always LF, whatever the editor or core.autocrlf.
+*.sh text eol=lf

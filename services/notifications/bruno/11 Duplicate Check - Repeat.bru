@@ -1,0 +1,37 @@
+meta {
+  name: Duplicate Check - Repeat
+  type: http
+  seq: 11
+}
+
+post {
+  url: {{baseUrl}}/notify_refund
+  body: json
+  auth: none
+}
+
+headers {
+  X-API-Key: {{apiKey}}
+}
+
+body:json {
+  {
+    "notification_id": "dup-check-{{runId}}",
+    "email": "participant@example.com",
+    "name": "Alex",
+    "event_title": "Off-campus Beach Day",
+    "amount": 1500,
+    "currency": "SGD",
+    "registration_id": 1001,
+    "refund_id": "re_3Pxyz"
+  }
+}
+
+assert {
+  res.status: eq 200
+  res.body.status: eq duplicate
+}
+
+docs {
+  Same notification_id as the previous request: no second email is sent.
+}

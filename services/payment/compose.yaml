@@ -1,0 +1,53 @@
+# Local stack for the Payment Service: RabbitMQ and the service itself (built from this repo's Dockerfile).
+#
+#   docker compose up -d --build        payment + rabbitmq
+#   docker compose ps                   health of both containers
+#   docker compose logs -f payment      follow the service logs
+#   docker compose down                 stop (add -v to also delete the RabbitMQ volume)
+#
+# Settings come from the git-ignored dev.env next to this file (copy dev.env.example): the same file as for
+# ./mvnw spring-boot:run. Only the two host names differ inside Docker, so they are overridden below.
+#
+# MySQL is NOT started here: the service uses the existing local `payment` database on this machine
+# (host.docker.internal:3306) and only validates its schema; it never creates or drops tables.
+#
+# Published ports: 8080 payment (GET /health), 5672/15672 RabbitMQ (management UI: http://localhost:15672, guest/guest).
+# The integration tests use their own stack: ci/compose.test.yaml.
+
+name: payment
+
+services:
+  rabbitmq:
+    image: rabbitmq:4.3-management
+    hostname: rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    restart: unless-stopped
+
+  payment:
+    build: .
+    image: partyfun-payment
+    env_file: dev.env
+    environment:
+      db_host: host.docker.internal
+      rabbitmq_host: rabbitmq
+    extra_hosts:
+      # Lets the container reach MySQL on this machine (needed on Linux; built in on Docker Desktop).
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "8080:8080"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  rabbitmq_data:

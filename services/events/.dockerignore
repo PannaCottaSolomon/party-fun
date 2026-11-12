@@ -1,0 +1,22 @@
+# Allowlist: ignore everything, then re-include only what the Dockerfile COPYs.
+# The build needs just pom.xml and the main sources/resources; anything else (git history, IDE files,
+# docs, local .env files, build output, tests) stays out of the build context and the image.
+*
+
+!pom.xml
+!src/main/
+# Note: src/main/resources/application.properties IS included on purpose. It holds no secrets; passwords
+# come from environment variables at runtime (see .env.example).
+
+# Never send local secrets to the Docker daemon, even if they end up inside an allowed folder.
+**/.env
+**/.env.*
+**/*.env
+**/application-local.*
+**/application-secret*
+**/*.pem
+**/*.key
+**/*.p12
+**/*.jks
+**/*.keystore
+**/docs/

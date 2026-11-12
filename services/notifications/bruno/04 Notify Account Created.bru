@@ -1,0 +1,33 @@
+meta {
+  name: Notify Account Created
+  type: http
+  seq: 4
+}
+
+post {
+  url: {{baseUrl}}/notify_account_created
+  body: json
+  auth: none
+}
+
+headers {
+  X-API-Key: {{apiKey}}
+}
+
+body:json {
+  {
+    "notification_id": "account_created-{{runId}}",
+    "email": "newuser@example.com",
+    "name": "Jamie",
+    "role": "participant"
+  }
+}
+
+script:pre-request {
+  bru.setVar("runId", Date.now());
+}
+
+assert {
+  res.status: eq 200
+  res.body.status: eq sent
+}

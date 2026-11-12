@@ -1,0 +1,43 @@
+# The admin web (React, served by nginx) on http://localhost:8001, built from this repo's Dockerfile.
+#
+#   docker compose up -d --build        build and start (run it again after a code change)
+#   docker compose logs -f frontend     follow nginx's logs
+#   docker compose down                 stop
+#
+# Settings come from the git-ignored .env next to this file (copy .env.example; .dockerignore keeps it out of the
+# image). Compose reads it automatically, and `npm run dev` reads the same file. The VITE_* values are baked into the
+# JavaScript at build time; the two Payment keys go only to nginx, which adds them to the Admin dashboard's and the
+# cancellation refunds' calls, so the browser never gets them.
+#
+# Only the site starts here. The services run from their own folders, and nginx reaches them through the ports they
+# publish on this machine (host.docker.internal): Payment :8080 (services/payment), Events :8083 and
+# Authentication :8082 for /gw/... (override with PAYMENT_UPSTREAM / EVENTS_UPSTREAM / AUTH_UPSTREAM in .env).
+
+name: frontend
+
+services:
+  frontend:
+    build:
+      context: .
+      args:
+        # Public values the browser uses, so this machine's ports (localhost), not container names. A missing client
+        # id stops the build instead of producing a site that can't log in.
+        VITE_COGNITO_REGION: ${VITE_COGNITO_REGION:?set VITE_COGNITO_REGION in .env}
+        VITE_COGNITO_CLIENT_ID: ${VITE_COGNITO_CLIENT_ID:?set VITE_COGNITO_CLIENT_ID in .env}
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-/gw}
+        VITE_PAYMENT_API_URL: ${VITE_PAYMENT_API_URL:-http://localhost:8080}
+        VITE_USER_API_URL: ${VITE_USER_API_URL:-http://localhost:8082}
+    image: partyfun-frontend
+    environment:
+      # Empty = the Payment Service refuses the forwarded Admin / refund calls (401); the rest of the site still works.
+      payment_admin_api_key: ${payment_admin_api_key:-}
+      payment_service_api_key: ${payment_service_api_key:-}
+      PAYMENT_UPSTREAM: ${PAYMENT_UPSTREAM:-http://host.docker.internal:8080}
+      EVENTS_UPSTREAM: ${EVENTS_UPSTREAM:-http://host.docker.internal:8083}
+      AUTH_UPSTREAM: ${AUTH_UPSTREAM:-http://host.docker.internal:8082}
+    extra_hosts:
+      # Lets nginx reach the services' published ports on this machine (needed on Linux; built in on Docker Desktop).
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "8001:80"
+    restart: unless-stopped

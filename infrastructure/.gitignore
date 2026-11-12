@@ -1,0 +1,14 @@
+# Local settings (AWS profile, URLs); see config.env.example
+config.env
+
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Never commit credentials
+*.pem
+.env
+credentials

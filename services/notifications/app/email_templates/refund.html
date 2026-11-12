@@ -1,0 +1,10 @@
+{% extends "base.html" %}
+{% block heading %}Your refund has been issued{% endblock %}
+{% block body %}
+<p>We've refunded <strong>{{ amount | money(currency) }}</strong> for <strong>{{ event_title }}</strong>.</p>
+<table role="presentation" cellpadding="0" cellspacing="0" style="margin:16px 0;">
+  <tr><td style="padding:4px 16px 4px 0;color:#7b8794;">Booking ref</td><td>{{ registration_id }}</td></tr>
+  {% if refund_id %}<tr><td style="padding:4px 16px 4px 0;color:#7b8794;">Refund ref</td><td>{{ refund_id }}</td></tr>{% endif %}
+</table>
+<p>Refunds usually reach your card within 5–10 business days, depending on your bank.</p>
+{% endblock %}

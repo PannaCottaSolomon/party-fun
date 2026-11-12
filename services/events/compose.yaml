@@ -1,0 +1,100 @@
+# Local stack for the Events Service: PostgreSQL, RabbitMQ, the service itself (built from this repo's Dockerfile) and
+# a WireMock stand-in for the payment service.
+#
+#   docker compose up -d --build        events + postgres + rabbitmq + payment-stub
+#   docker compose ps                   health of every container
+#   docker compose logs -f events       follow the service logs
+#   docker compose down                 stop (add -v to also delete the database volumes)
+#
+# Chaos by hand (README "Chaos engineering"): "docker compose stop payment-stub" or "docker compose stop rabbitmq",
+# try a signup or a cancel, start it again, and watch the payment recovery job and the outbox catch up in the logs.
+#
+# Credentials come from the git-ignored .env file next to this one (Compose reads it automatically for ${...}):
+# DB_PASSWORD and RABBITMQ_PASSWORD are required, DB_USERNAME and RABBITMQ_USERNAME default to postgres / guest.
+#
+# payment-stub serves the same stubs as the tests (src/test/resources/wiremock/payment): POST /bookings, POST /payments
+# (pm_card_visa pays, pm_card_chargeDeclined is declined), GET /payments/booking/{id} and POST /payments/{id}/refund,
+# which needs the service key like the real one. No Stripe key or MySQL needed. To use the real payment service
+# instead, run it from its own repository and set EVENTS_PAYMENT_BASE_URL and PAYMENT_SERVICE_API_KEY in .env.
+#
+# Published ports: 8080 events, 5672/15672 RabbitMQ (management UI: http://localhost:15672), 8089 payment-stub
+# (WireMock's admin API: http://localhost:8089/__admin/requests lists every call the service made to it).
+# PostgreSQL is not published, so it never clashes with a database already running on this machine;
+# use "docker compose exec postgres psql -U postgres -d events_db" to inspect the events database.
+
+name: events
+
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: events_db
+      POSTGRES_USER: ${DB_USERNAME:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD in .env}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d events_db"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  rabbitmq:
+    image: rabbitmq:4.3-management
+    hostname: rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USERNAME:-guest}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:?Set RABBITMQ_PASSWORD in .env}
+    ports:
+      # RABBITMQ_PORT / RABBITMQ_UI_PORT if another broker already uses 5672 / 15672 on this machine
+      - "${RABBITMQ_PORT:-5672}:5672"
+      - "${RABBITMQ_UI_PORT:-15672}:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+  # The payment service's REST contract, from the same WireMock stubs the tests use (read-only)
+  payment-stub:
+    image: wiremock/wiremock:3.13.2
+    volumes:
+      - ./src/test/resources/wiremock/payment:/home/wiremock:ro
+    ports:
+      - "8089:8080"
+    restart: unless-stopped
+
+  events:
+    build: .
+    image: events:local
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/events_db
+      DB_USERNAME: ${DB_USERNAME:-postgres}
+      DB_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD in .env}
+      SPRING_RABBITMQ_HOST: rabbitmq
+      RABBITMQ_USERNAME: ${RABBITMQ_USERNAME:-guest}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:?Set RABBITMQ_PASSWORD in .env}
+      EVENTS_PAYMENT_BASE_URL: ${EVENTS_PAYMENT_BASE_URL:-http://payment-stub:8080}
+      # Any value works with payment-stub; the real payment service needs its payment_service_api_key
+      PAYMENT_SERVICE_API_KEY: ${PAYMENT_SERVICE_API_KEY:-local-service-key}
+      # Cognito user pool that issues the access tokens; without COGNITO_USER_POOL_ID every token is rejected (401)
+      AWS_REGION: ${AWS_REGION:-ap-southeast-1}
+      COGNITO_USER_POOL_ID: ${COGNITO_USER_POOL_ID:-}
+      SPRING_JPA_SHOW_SQL: "false"
+    ports:
+      - "${EVENTS_PORT:-8080}:8080"   # EVENTS_PORT=18080 if 8080 is taken (e.g. by mvnw spring-boot:run)
+    # Health: the image's HEALTHCHECK (GET /actuator/health/liveness)
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  rabbitmq_data:

@@ -1,0 +1,181 @@
+####################################################################
+# CI/CD pipeline for the notification microservice.
+#
+#   static_analysis   ruff, pylint, dependency-scan, and GitLab's SAST
+#                     and secret detection scanners, all concurrent.
+#   test              unit tests plus integration tests against a real
+#                     RabbitMQ broker and a real MySQL database, both
+#                     started as CI services.
+#   release           build the Docker image, push it to this project's
+#                     GitLab container registry, produce an SBOM, and
+#                     scan the image for known vulnerabilities.
+#
+# Deploying is done by the infrastructure repo's deploy-notifications job
+# (CloudFormation), with the image this pipeline released.
+#
+# The service is triggered two ways - RabbitMQ messages and HTTP
+# endpoints - so the tests cover both: the HTTP side with Flask's test
+# client, and the RabbitMQ side end to end (publish a message, check the
+# email was sent, or that a bad message ended up in the dead-letter queue).
+####################################################################
+
+include:
+  - template: Jobs/SAST.gitlab-ci.yml
+  - template: Jobs/Secret-Detection.gitlab-ci.yml
+
+stages:
+  - static_analysis
+  - test
+  - release
+
+####################################################################
+# Static analysis
+####################################################################
+
+ruff:
+  stage: static_analysis
+  image: python:3.14-slim
+  before_script:
+    - python -V
+    - python -m pip install ruff==0.16.1
+  script:
+    - ruff check app tests scripts | tee ruff_report.txt
+  artifacts:
+    when: on_failure
+    paths:
+      - ruff_report.txt
+
+pylint:
+  stage: static_analysis
+  image: python:3.14-slim
+  before_script:
+    - python -V
+    # Install the service's dependencies first, so that pylint can
+    # resolve pika, flask, etc. rather than reporting them missing.
+    - python -m pip install -r requirements.txt
+    - python -m pip install pylint==4.0.6
+  script:
+    - pylint --fail-under=7 app | tee pylint_report.txt
+  artifacts:
+    when: always
+    paths:
+      - pylint_report.txt
+
+dependency-scan:
+  stage: static_analysis
+  image: python:3.14-slim
+  before_script:
+    - python -m pip install pip-audit
+  script:
+    - pip-audit -r requirements.txt | tee pip_audit_report.txt
+  artifacts:
+    when: always
+    paths:
+      - pip_audit_report.txt
+  # A CVE can be published overnight against a library pinned months ago,
+  # with no fixed version available yet. Blocking every push on that would
+  # stop the team, so this job reports rather than halts.
+  allow_failure: true
+
+# GitLab's security templates put their jobs in the 'test' stage. These
+# two blocks re-declare the jobs by name, which merges the new key into
+# the template's definition rather than replacing it, so all that changes
+# is which stage they run in.
+semgrep-sast:
+  stage: static_analysis
+
+secret_detection:
+  stage: static_analysis
+
+####################################################################
+# Test
+####################################################################
+
+test:
+  stage: test
+  image: python:3.14-slim
+  services:
+    # A real broker, reachable from the job as host "rabbitmq".
+    - name: rabbitmq:3.13
+      alias: rabbitmq
+    # A real MySQL for the notification log, reachable as host "mysql".
+    - name: mysql:8.4
+      alias: mysql
+  variables:
+    # Setting these switches on tests/test_integration_rabbitmq.py and
+    # tests/test_integration_mysql.py; without them those tests are skipped
+    # (e.g. on a laptop with no broker or database).
+    INTEGRATION_RABBITMQ_URL: "amqp://guest:guest@rabbitmq:5672/%2F"
+    INTEGRATION_MYSQL_URL: "mysql://root:test@mysql:3306/notifications"
+    # Read by the mysql service container on startup (test-only credentials).
+    MYSQL_ROOT_PASSWORD: "test"
+    MYSQL_DATABASE: "notifications"
+  before_script:
+    - python -V
+    - python -m pip install -r requirements-dev.txt
+  script:
+    - python -m pytest --junitxml=report.xml --cov=app --cov-report=term --cov-report=xml:coverage.xml
+  # Shows the coverage percentage on the merge request and pipeline pages.
+  coverage: '/TOTAL.*\s+(\d+%)$/'
+  artifacts:
+    when: always
+    reports:
+      junit: report.xml
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage.xml
+
+####################################################################
+# Release
+####################################################################
+
+# based on: https://gitlab.com/gitlab-org/gitlab/-/blob/master/lib/gitlab/ci/templates/Docker.gitlab-ci.yml
+release-image:
+  stage: release
+  image: docker:29.6.2
+  services:
+    - docker:29.6.2-dind
+  variables:
+    # deploy-ecs works this tag out for itself, so it has to stay
+    # exactly as it is here.
+    IMAGE: "$CI_REGISTRY_IMAGE/$CI_COMMIT_REF_SLUG:$CI_COMMIT_SHA"
+  before_script:
+    # The password goes in on stdin rather than as an argument, so that
+    # it never appears in the runner's process list.
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin $CI_REGISTRY
+    - wget -qO install.sh https://raw.githubusercontent.com/anchore/syft/main/install.sh
+    - sh install.sh -b /usr/local/bin v1.50.0
+  script:
+    - docker build --pull -t "$IMAGE" .
+    - docker push "$IMAGE"
+    # The SBOM inventories the released image itself, not requirements.txt,
+    # so it covers everything the base image brings along too.
+    - docker save "$IMAGE" -o image.tar
+    - syft docker-archive:image.tar -o cyclonedx-json=sbom.json
+  artifacts:
+    when: on_success
+    paths:
+      - sbom.json
+
+container-scan:
+  stage: release
+  needs: ["release-image"]
+  image:
+    name: aquasec/trivy:latest
+    entrypoint: [""]
+  variables:
+    # Must match release-image's tag.
+    IMAGE: "$CI_REGISTRY_IMAGE/$CI_COMMIT_REF_SLUG:$CI_COMMIT_SHA"
+    TRIVY_USERNAME: $CI_REGISTRY_USER
+    TRIVY_PASSWORD: $CI_REGISTRY_PASSWORD
+    TRIVY_AUTH_URL: $CI_REGISTRY
+    TRIVY_NO_PROGRESS: "true"
+  script:
+    # Report CRITICAL vulnerabilities that already have a fix.
+    - trivy image --exit-code 1 --severity CRITICAL --ignore-unfixed "$IMAGE" | tee trivy_report.txt
+  artifacts:
+    when: always
+    paths:
+      - trivy_report.txt
+  # Same reasoning as dependency-scan: report, don't block the team.
+  allow_failure: true

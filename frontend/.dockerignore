@@ -1,0 +1,16 @@
+node_modules/
+.npm/
+dist/
+coverage/
+.git/
+.gitignore
+.gitlab-ci.yml
+README.md
+*.log
+.idea/
+.vscode/
+
+# local environment files never go into the image
+.env
+.env.*
+*.env
