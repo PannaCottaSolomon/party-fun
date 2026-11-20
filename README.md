@@ -1,4 +1,4 @@
-# party.fun
+# Party Fun
 
 party.fun is an event discovery and ticketing platform for university events. Organisers publish events with a
 ticket price, a capacity and a minimum number of signups. Participants buy tickets by card, and every signup pushes
@@ -16,6 +16,8 @@ and the failure handling are as much the point as the features.
 | **Admin** | Review refunds that failed for good and retry them from a dashboard |
 
 Payments run in a Stripe **sandbox**: test cards only, and no real money ever moves.
+
+![Browse events in home page!](homepage.png)
 
 ## Contents
 
