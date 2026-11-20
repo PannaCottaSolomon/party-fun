@@ -1,6 +1,10 @@
-# Party Fun
+# Party Fun 🎉🥳🎊
 
-party.fun is an event discovery and ticketing platform for university events. Organisers publish events with a
+## Overview
+
+![Screenshot of the Party Fun homepage showing available events and hype meters](homepage.png)
+
+**party.fun** is an event discovery and ticketing platform for university events. Organisers publish events with a
 ticket price, a capacity and a minimum number of signups. Participants buy tickets by card, and every signup pushes
 the event's "hype meter" towards that minimum. An event that misses its minimum by its deadline is cancelled
 automatically and everyone who paid is refunded.
@@ -16,8 +20,6 @@ and the failure handling are as much the point as the features.
 | **Admin** | Review refunds that failed for good and retry them from a dashboard |
 
 Payments run in a Stripe **sandbox**: test cards only, and no real money ever moves.
-
-![Browse events in home page!](homepage.png)
 
 ## Contents
 
