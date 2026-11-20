@@ -1,7 +1,5 @@
 # Party Fun 🎉🥳🎊
 
-## Overview
-
 ![Screenshot of the Party Fun homepage showing available events and hype meters](homepage.png)
 
 **party.fun** is an event discovery and ticketing platform for university events. Organisers publish events with a
